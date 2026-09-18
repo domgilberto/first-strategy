@@ -17,7 +17,7 @@ in order of importance:
   * The bot must not depend on it. The server runs on a daemon thread; if it
     cannot start (no port, no token) trading continues and a warning is logged.
 
-Window semantics:
+Window semantics (every data route accepts `since` and `until`, epoch ms):
 
   TWR over a window   = chain_end / chain_at_window_start - 1   (exact, from the
                         stored chain - no recomputation)
@@ -35,8 +35,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from runtime import log
+from state import iso_utc
 
 MIN_ANNUALISE_DAYS = 7
+DAY_MS = 86_400_000
+MAX_WINDOW_MS = 400 * DAY_MS
 
 
 def _annualise(total_return, elapsed_ms):
@@ -45,7 +48,7 @@ def _annualise(total_return, elapsed_ms):
     caller omits the figure rather than printing something misleading."""
     if total_return is None or elapsed_ms <= 0:
         return None
-    days = elapsed_ms / 86_400_000
+    days = elapsed_ms / DAY_MS
     if days < MIN_ANNUALISE_DAYS:
         return None
     return (1.0 + total_return) ** (365.0 / days) - 1.0
@@ -148,34 +151,50 @@ class Api:
         self.started_at = time.time()
         self._server = None
 
-    # --- handlers -----------------------------------------------------------
+    # --- window parsing -----------------------------------------------------
+
+    def _bounds(self, query):
+        """`since`/`until` in epoch ms. `until` defaults to now and is clamped
+        to it; `since` defaults to one day before `until`. A ValueError here
+        becomes a 400."""
+        now = int(time.time() * 1000)
+        until = min(int(query.get("until", [now])[0]), now)
+        since = int(query.get("since", [until - DAY_MS])[0])
+        if since >= until:
+            raise ValueError("since must be before until")
+        since = max(since, until - MAX_WINDOW_MS)
+        return since, until
 
     def _window(self, query):
-        now = int(time.time() * 1000)
-        since = int(query.get("since", [now - 86_400_000])[0])
+        since, until = self._bounds(query)
         limit = min(int(query.get("limit", [self.max_points])[0]), self.max_points)
-        rows = self.store.snapshots_since(since)
+        rows = self.store.snapshots_between(since, until)
         base = self.store.snapshot_at_or_before(since)
         points = window_series(rows, base)
-        flow_total, flow_count = self.store.flows_between(since, now)
-        return points, limit, flow_count, since
+        _, flow_count = self.store.flows_between(since, until)
+        return points, limit, flow_count, since, until
+
+    # --- handlers -----------------------------------------------------------
 
     def h_snapshots(self, query):
-        points, limit, _, since = self._window(query)
-        return {"since": since, "total": len(points), "points": stride_sample(points, limit)}
+        points, limit, _, since, until = self._window(query)
+        return {"since": since, "until": until, "total": len(points),
+                "points": stride_sample(points, limit)}
 
     def h_summary(self, query):
-        points, _, flow_count, since = self._window(query)
-        summary = summarise(points, self.snapshotter.interval, flow_count, self.store.all_time_max_drawdown())
-        summary["since"] = since
+        points, _, flow_count, since, until = self._window(query)
+        summary = summarise(points, self.snapshotter.interval, flow_count,
+                            self.store.all_time_max_drawdown())
+        summary["since"], summary["until"] = since, until
         return summary
 
     def h_performance(self, query):
         """Series and summary together, from one read, so a client can never
         show a headline that disagrees with the chart beneath it."""
-        points, limit, flow_count, since = self._window(query)
+        points, limit, flow_count, since, until = self._window(query)
         return {
             "since": since,
+            "until": until,
             "series": stride_sample(points, limit),
             "summary": summarise(points, self.snapshotter.interval, flow_count,
                                  self.store.all_time_max_drawdown()),
@@ -183,6 +202,10 @@ class Api:
 
     def h_trades(self, query):
         limit = min(int(query.get("limit", [200])[0]), 1000)
+        if "since" in query or "until" in query:
+            since, until = self._bounds(query)
+            return {"since": since, "until": until,
+                    "trades": self.store.round_trips_between(iso_utc(since), iso_utc(until), limit)}
         return {"trades": self.store.recent_round_trips(limit)}
 
     def h_status(self, query):

@@ -4,8 +4,9 @@ Persistent state, on the TradingHost persistent volume.
 Three tables, three different kinds of truth:
 
   round_trips       The bot's own record of what it *intended* and what came
-                    back - both order ids, both fill prices, the fee drag. The
-                    broker cannot produce this view; it sees two unrelated orders.
+                    back - when it opened, when it closed, both order ids, both
+                    fill prices, the fee drag. The broker cannot produce this
+                    view; it sees two unrelated orders.
 
   equity_snapshots  Immutable history. A past equity value never changes, so it
                     is safe to persist - unlike positions or balances, which must
@@ -19,6 +20,9 @@ Three tables, three different kinds of truth:
 Writes are serialised with a lock; the connection is shared across the trader,
 snapshotter and API threads. WAL mode lets the API read while a write is in
 flight.
+
+Schema changes are applied as idempotent migrations in `_migrate`, because the
+database lives on a persistent volume and outlives any one version of the code.
 """
 
 import os
@@ -28,14 +32,15 @@ import time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS round_trips (
-    ts            TEXT NOT NULL,
+    ts            TEXT NOT NULL,   -- close time (exit fill), ISO-8601 UTC
     symbol        TEXT NOT NULL,
     qty           REAL NOT NULL,
     buy_order_id  TEXT,
     buy_price     REAL,
     sell_order_id TEXT,
     sell_price    REAL,
-    pnl           REAL
+    pnl           REAL,
+    opened_ts     TEXT             -- open time (entry fill), ISO-8601 UTC; NULL on legacy rows
 );
 
 CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -60,6 +65,18 @@ CREATE TABLE IF NOT EXISTS cash_flows (
 CREATE INDEX IF NOT EXISTS cash_flows_ts ON cash_flows (ts);
 """
 
+# Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS does not
+# touch an existing table, so each is applied with ALTER TABLE when missing.
+MIGRATIONS = [
+    ("round_trips", "opened_ts", "TEXT"),
+]
+
+
+def iso_utc(ms):
+    """round_trips timestamps are ISO-8601 UTC strings; this produces the same
+    shape so window bounds compare correctly as text."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000))
+
 
 class Store:
     def __init__(self, data_dir):
@@ -70,8 +87,15 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.commit()
         self._lock = threading.Lock()
+
+    def _migrate(self):
+        for table, column, decl in MIGRATIONS:
+            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self):
         with self._lock:
@@ -80,19 +104,29 @@ class Store:
 
     # --- round trips --------------------------------------------------------
 
-    def record_round_trip(self, symbol, qty, buy_id, buy_price, sell_id, sell_price, pnl):
+    def record_round_trip(self, symbol, qty, buy_id, buy_price, sell_id, sell_price, pnl,
+                          opened_ms=None):
         with self._lock:
             self.db.execute(
                 "INSERT INTO round_trips (ts, symbol, qty, buy_order_id, buy_price, "
-                "sell_order_id, sell_price, pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                 symbol, qty, buy_id, buy_price, sell_id, sell_price, pnl),
+                "sell_order_id, sell_price, pnl, opened_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (iso_utc(time.time() * 1000), symbol, qty, buy_id, buy_price, sell_id, sell_price,
+                 pnl, iso_utc(opened_ms) if opened_ms else None),
             )
             self.db.commit()
 
     def recent_round_trips(self, limit):
         rows = self.db.execute(
             "SELECT rowid AS id, * FROM round_trips ORDER BY rowid DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def round_trips_between(self, since_iso, until_iso, limit):
+        """Filtered on close time - a trade belongs to the window it finished in."""
+        rows = self.db.execute(
+            "SELECT rowid AS id, * FROM round_trips WHERE ts >= ? AND ts <= ? "
+            "ORDER BY rowid DESC LIMIT ?",
+            (since_iso, until_iso, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -126,6 +160,13 @@ class Store:
     def snapshots_since(self, since_ms):
         rows = self.db.execute(
             "SELECT * FROM equity_snapshots WHERE ts >= ? ORDER BY ts ASC", (since_ms,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def snapshots_between(self, since_ms, until_ms):
+        rows = self.db.execute(
+            "SELECT * FROM equity_snapshots WHERE ts >= ? AND ts <= ? ORDER BY ts ASC",
+            (since_ms, until_ms),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -174,7 +215,9 @@ class Store:
     # --- stats --------------------------------------------------------------
 
     def counts(self):
-        snaps = self.db.execute("SELECT COUNT(*) AS n, MIN(ts) AS first, MAX(ts) AS last FROM equity_snapshots").fetchone()
+        snaps = self.db.execute(
+            "SELECT COUNT(*) AS n, MIN(ts) AS first, MAX(ts) AS last FROM equity_snapshots"
+        ).fetchone()
         trips = self.db.execute("SELECT COUNT(*) AS n FROM round_trips").fetchone()
         flows = self.db.execute("SELECT COUNT(*) AS n FROM cash_flows").fetchone()
         return {
