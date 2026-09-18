@@ -41,9 +41,17 @@ Never put them in `config.json`.
 | `APCA_API_KEY_ID` | Alpaca **paper** key id — begins with `PK` |
 | `APCA_API_SECRET_KEY` | Alpaca **paper** secret key |
 | `DASHBOARD_TOKEN` | Shared secret the dashboard presents to the API. Optional: without it the API stays off and trading continues |
+| `DASHBOARD_PORT` | **Workaround.** The allocated `targetPort` (e.g. `13174`). Only needed while TradingHost leaves `TRADINGHOST_PORTS` empty after adding a port to an existing deployment; ignored once the platform populates the list |
 
 > Changing a secret requires a **redeploy**, not a restart. A restart-in-place
 > keeps the old environment and will not pick up the new value.
+
+> **Platform note (2026-09-18).** Adding a port to an *existing* deployment
+> provisions the NodePort — the address routes and connections are refused
+> rather than timing out — but neither a pod restart nor a strategy redeploy
+> rebuilds the strategy's `TRADINGHOST_PORTS`; it stays `[]` across starts.
+> `main.py` therefore falls back to a `DASHBOARD_PORT` strategy secret so the
+> API can still bind. The platform list takes precedence whenever populated.
 
 ## Tunables
 

@@ -14,6 +14,9 @@ Required TradingHost strategy secrets (environment variables):
     DASHBOARD_TOKEN      shared secret the dashboard presents to the API
                          (optional - without it the API stays off and trading
                          continues)
+    DASHBOARD_PORT       workaround: the allocated targetPort, for when the
+                         platform leaves TRADINGHOST_PORTS empty (see
+                         resolve_api_port)
 
 Non-secret tunables live in config.json, seeded from config.example.json.
 """
@@ -33,6 +36,25 @@ from strategy import Trader
 
 DATA_DIR = os.environ.get("TRADINGHOST_DATA_DIR", "/data")
 PORTS = json.loads(os.environ.get("TRADINGHOST_PORTS", "[]"))
+
+
+def resolve_api_port():
+    """Prefer the platform-injected port list; fall back to DASHBOARD_PORT.
+
+    TradingHost provisions the NodePort when a port is added to an existing
+    deployment, but - as observed on 2026-09-18 - neither a pod restart nor a
+    strategy redeploy rebuilds TRADINGHOST_PORTS afterwards; the list stays
+    empty. Until that is fixed platform-side the port number can be supplied
+    as a strategy secret. It is not secret; it is simply the only
+    per-deployment env injection the platform offers. Once TRADINGHOST_PORTS
+    is populated it takes precedence and the override is ignored.
+    """
+    if PORTS:
+        return int(PORTS[0]["targetPort"]), "TRADINGHOST_PORTS"
+    override = os.environ.get("DASHBOARD_PORT", "").strip()
+    if override.isdigit():
+        return int(override), "DASHBOARD_PORT"
+    return None, None
 
 
 def main():
@@ -82,19 +104,23 @@ def main():
         store=store.counts())
 
     api_server = None
-    if not PORTS:
-        log("warn", "No port allocated - dashboard API disabled",
-            hint="Allocate a port on the deployment to expose the read-only API.")
+    port, port_source = resolve_api_port()
+    if port is None:
+        log("warn", "No port available - dashboard API disabled",
+            hint="TRADINGHOST_PORTS is empty. Allocate a port on the deployment; if it still "
+                 "does not appear here after a redeploy, set DASHBOARD_PORT=<targetPort> as a "
+                 "strategy secret as a workaround.")
     elif not dashboard_token:
         log("warn", "DASHBOARD_TOKEN not set - dashboard API disabled",
+            port=port, port_source=port_source,
             hint="Set DASHBOARD_TOKEN as a strategy secret and redeploy to enable it.")
     else:
         try:
-            api_server = Api(store, trader, snapshotter, dashboard_token,
-                             PORTS[0]["targetPort"], config["api_max_points"])
+            api_server = Api(store, trader, snapshotter, dashboard_token, port, config["api_max_points"])
             api_server.serve_forever_in_thread()
-            log("info", "Dashboard API reachable at",
-                url=f"http://{PORTS[0].get('publicIp', '<publicIp>')}:{PORTS[0]['nodePort']}")
+            public_ip = PORTS[0].get("publicIp") if PORTS else None
+            log("info", "Dashboard API enabled", port=port, port_source=port_source,
+                url=f"http://{public_ip or '<publicIp>'}:{port}")
         except Exception as exc:
             log("error", "Dashboard API failed to start - trading continues without it", error=str(exc))
 

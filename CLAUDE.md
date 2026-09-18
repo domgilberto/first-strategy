@@ -12,7 +12,9 @@ Canonical platform conventions live in the template repo this project follows:
   refuses to start on a key that does not begin with `PK`. Do not add a live-trading
   code path without an explicit, deliberate request.
 - **Never hardcode credentials.** They arrive as environment variables from TradingHost
-  strategy secrets: `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `DASHBOARD_TOKEN`.
+  strategy secrets: `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `DASHBOARD_TOKEN`, plus the
+  `DASHBOARD_PORT` workaround (see `resolve_api_port` in `main.py` — the platform list
+  `TRADINGHOST_PORTS` takes precedence whenever it is populated).
 - **Never put secrets in `config.json` / `config.example.json`** — those are committed
   to git and are for non-secret tunables only.
 - **Never write state outside `TRADINGHOST_DATA_DIR`** — everything else is ephemeral.
