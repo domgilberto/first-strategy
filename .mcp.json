@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tradinghost": {
+      "type": "http",
+      "url": "https://app.tradinghost.com/mcp"
+    }
+  }
+}

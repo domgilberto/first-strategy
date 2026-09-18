@@ -1,0 +1,11 @@
+# This strategy deliberately has no third-party dependencies.
+#
+# It uses only the Python standard library plus `requests`, which is already
+# pre-installed in the TradingHost container. Listing nothing here keeps deploys
+# near-instant and keeps the resident set well inside the 256 MB allocation.
+#
+# Do NOT add numpy/pandas/scipy/scikit-learn/requests/websockets - they are
+# pre-installed and re-listing them only slows down deploys.
+#
+# If you later add indicators, use the pure-Python `ta` package, never TA-Lib
+# (the TA-Lib C library is not present in the container and cannot be installed).
