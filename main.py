@@ -148,6 +148,12 @@ class Alpaca:
     def cancel_all_orders(self):
         self.session.delete(TRADING_BASE + "/v2/orders", timeout=15)
 
+    def close_position(self, position_symbol):
+        """Liquidate the whole position. Preferred over selling a computed
+        quantity: Alpaca deducts a trading fee from the filled crypto quantity,
+        so the position is always slightly smaller than the amount ordered."""
+        return self._request("DELETE", f"/v2/positions/{position_symbol}")
+
     def submit_order(self, symbol, qty, side):
         return self._request("POST", "/v2/orders", json={
             "symbol": symbol,
@@ -158,12 +164,16 @@ class Alpaca:
         })
 
 
-def position_qty(api, symbol):
+def find_position(api, symbol):
+    """Return the raw position record, or None. Alpaca reports crypto positions
+    without the slash (BTCUSD, not BTC/USD), so match on the normalised form and
+    hand back whatever spelling the API used - that is what the close endpoint
+    expects."""
     wanted = symbol.replace("/", "")
     for pos in api.positions():
         if pos.get("symbol", "").replace("/", "") == wanted:
-            return float(pos.get("qty", 0))
-    return 0.0
+            return pos
+    return None
 
 
 def await_terminal(api, order_id, timeout):
@@ -219,19 +229,21 @@ def _price(order):
 
 def flatten(api, symbol, timeout, reason):
     """Close any open position. Used on startup and on shutdown."""
-    qty = position_qty(api, symbol)
-    if qty <= 0:
+    pos = find_position(api, symbol)
+    if pos is None:
         return 0.0
-    log("warn", "Flattening open position", symbol=symbol, qty=qty, reason=reason)
-    order = api.submit_order(symbol, qty, "sell")
+    qty = float(pos.get("qty", 0))
+    log("warn", "Flattening open position", symbol=pos.get("symbol"),
+        qty=qty, reason=reason)
+    order = api.close_position(pos["symbol"])
     order = await_terminal(api, order["id"], timeout)
-    log("info", "Flatten complete", symbol=symbol, qty=qty,
+    log("info", "Flatten complete", symbol=pos.get("symbol"), qty=qty,
         status=order.get("status"), price=_price(order))
     return qty
 
 
 def round_trip(api, db, symbol, qty, timeout):
-    """Buy at market, confirm the fill, then sell it straight back."""
+    """Buy at market, confirm the fill, then close the position straight back out."""
     buy = api.submit_order(symbol, qty, "buy")
     log("info", "BUY submitted", symbol=symbol, qty=qty, order_id=buy.get("id"))
 
@@ -242,16 +254,28 @@ def round_trip(api, db, symbol, qty, timeout):
         return False
 
     buy_price = _price(buy)
-    filled = float(buy.get("filled_qty") or qty)
-    log("info", "BUY filled", symbol=symbol, qty=filled, price=buy_price,
+    bought = float(buy.get("filled_qty") or qty)
+    log("info", "BUY filled", symbol=symbol, qty=bought, price=buy_price,
         order_id=buy.get("id"))
 
     with _lock:
-        _status["position_qty"] = filled
+        _status["position_qty"] = bought
         _status["last_buy_price"] = buy_price
 
-    sell = api.submit_order(symbol, filled, "sell")
-    log("info", "SELL submitted", symbol=symbol, qty=filled, order_id=sell.get("id"))
+    # Close the position rather than selling `bought`: Alpaca deducts its crypto
+    # fee from the filled quantity, so the position is a little smaller than the
+    # amount ordered and selling the ordered size is rejected for insufficient
+    # balance.
+    pos = find_position(api, symbol)
+    if pos is None:
+        log("error", "No position found after a filled buy - cannot close",
+            symbol=symbol, order_id=buy.get("id"))
+        return False
+
+    holding = float(pos.get("qty", 0))
+    sell = api.close_position(pos["symbol"])
+    log("info", "SELL submitted", symbol=pos.get("symbol"), qty=holding,
+        order_id=sell.get("id"))
 
     sell = await_terminal(api, sell["id"], timeout)
     if sell.get("status") != "filled":
@@ -260,14 +284,21 @@ def round_trip(api, db, symbol, qty, timeout):
         return False
 
     sell_price = _price(sell)
-    pnl = round((sell_price - buy_price) * filled, 6) if buy_price and sell_price else None
+    sold = float(sell.get("filled_qty") or holding)
 
-    log("info", "SELL filled", symbol=symbol, qty=filled, price=sell_price,
-        order_id=sell.get("id"))
-    log("info", "Round trip complete", symbol=symbol, qty=filled,
+    # Value in, value out - this captures the fee drag, which a naive
+    # (sell_price - buy_price) * qty would hide entirely.
+    pnl = None
+    if buy_price and sell_price:
+        pnl = round((sell_price * sold) - (buy_price * bought), 6)
+
+    log("info", "SELL filled", symbol=pos.get("symbol"), qty=sold,
+        price=sell_price, order_id=sell.get("id"))
+    log("info", "Round trip complete", symbol=symbol,
+        bought=bought, sold=sold, fee_drag=round(bought - sold, 10),
         buy_price=buy_price, sell_price=sell_price, pnl=pnl)
 
-    record_round_trip(db, symbol, filled, buy, sell, pnl)
+    record_round_trip(db, symbol, sold, buy, sell, pnl)
 
     with _lock:
         _status["position_qty"] = 0.0
