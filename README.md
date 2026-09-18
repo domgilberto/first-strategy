@@ -1,89 +1,154 @@
 # first-strategy
 
 A BTC/USD **order-path smoke test** running on [TradingHost](https://app.tradinghost.com)
-against [Alpaca](https://alpaca.markets) **paper** trading.
+against [Alpaca](https://alpaca.markets) **paper** trading — plus the persistence
+layer a real strategy needs: a 5-minute equity history with time-weighted return
+and drawdown, the bot's own trade ledger, and a read-only API so a dashboard can
+see all of it.
 
 ## What this is — and isn't
 
-It opens and closes one position every cycle, at market. That is the entire logic.
+The trader opens and closes one position every cycle, at market. That is its
+entire logic. It is a **connectivity test, not a trading strategy**: it exists to
+prove that code inside a TradingHost container can reach Alpaca, place an order,
+observe the fill and close it. It pays the spread twice a minute and loses money
+by design. **Never point it at a live account.** The process refuses to start on
+a key that does not begin with `PK`.
 
-This is a **connectivity test, not a trading strategy**. It exists to prove that code
-running inside a TradingHost container can reach Alpaca, place an order, observe the
-fill, and close the position — and that the whole loop (write in Claude → push to
-GitHub → redeploy → execute) works end to end.
+The persistence and API around it are the reusable part.
 
-It round-trips at market every minute, so it pays the spread twice per cycle and will
-steadily lose money by design. **Never point it at a live account.** The process
-refuses to start on a key that does not begin with `PK`.
+## Layout
+
+| Module | Job |
+|---|---|
+| `main.py` | Orchestration only: config, threads, trading loop, shutdown |
+| `strategy.py` | The round-trip trader; records intent + outcome per trade |
+| `snapshots.py` | Every 5 min: equity snapshot with incremental TWR chain and running peak |
+| `api.py` | Read-only bearer-token JSON API over the persisted state |
+| `state.py` | SQLite on the persistent volume: `round_trips`, `equity_snapshots`, `cash_flows` |
+| `alpaca.py` | The one broker client, shared by the trader and the snapshotter |
+| `config.py` | Tunables, seeded to the volume and merged over committed defaults |
+| `runtime.py` | Shutdown flag, structured `log`, interruptible sleep |
+| `tests/` | Pins the properties that make the numbers trustworthy |
 
 ## Required secrets
 
-Set as **TradingHost strategy secrets** — they arrive as environment variables. Never
-put them in `config.json`.
+Set as **TradingHost strategy secrets** — they arrive as environment variables.
+Never put them in `config.json`.
 
 | Variable | Value |
 |---|---|
 | `APCA_API_KEY_ID` | Alpaca **paper** key id — begins with `PK` |
 | `APCA_API_SECRET_KEY` | Alpaca **paper** secret key |
+| `DASHBOARD_TOKEN` | Shared secret the dashboard presents to the API. Optional: without it the API stays off and trading continues |
 
-> Changing a secret requires a **redeploy**, not a restart. A restart-in-place keeps
-> the old environment and will not pick up the new value.
+> Changing a secret requires a **redeploy**, not a restart. A restart-in-place
+> keeps the old environment and will not pick up the new value.
 
 ## Tunables
 
-`config.example.json` is committed; it is seeded once to
-`{TRADINGHOST_DATA_DIR}/config.json` on the persistent volume, where you can edit it
-without redeploying code.
+`config.example.json` is committed and seeded once to
+`{TRADINGHOST_DATA_DIR}/config.json`, where you can edit it without redeploying.
+The loader merges the persisted copy over the committed defaults and logs any
+keys that are missing or no longer used, so an older config never crashes a
+newer version.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `symbol` | `BTC/USD` | Alpaca crypto pair (24/7, so it trades at any hour) |
+| `symbol` | `BTC/USD` | Alpaca crypto pair — 24/7, so it trades at any hour |
 | `order_qty` | `0.001` | Order size in BTC |
 | `cycle_seconds` | `60` | Seconds between round trips |
 | `fill_timeout_seconds` | `30` | How long to wait for an order to reach a terminal state |
+| `snapshot_seconds` | `300` | Equity snapshot cadence, aligned to the interval boundary |
+| `api_max_points` | `2000` | Longest series the API will return before thinning |
 
-Because the persisted copy survives deploys, it can be missing keys a newer version
-expects. The loader merges it over the committed defaults and logs both the missing
-keys and any it no longer uses, rather than crashing.
+## What gets persisted, and why
 
-## Cycle
+The broker is the system of record for **mutable state** — positions, balances —
+and the bot always asks rather than remembers. But two things are worth writing
+down here, because the broker either cannot or will not keep them:
 
-1. Market **buy** `order_qty`
-2. Poll the order until it reaches a terminal state
-3. Market **sell** the filled quantity back
-4. Poll again, log both fill prices and the realised P&L
-5. Record the round trip in SQLite, sleep until the next cycle
+**`equity_snapshots`** — immutable history. A past equity value never changes, so
+it is safe to persist. Alpaca serves recent portfolio history at fine resolution
+but that resolution ages out, and once gone it cannot be reconstructed. Drawdown
+measured on coarser samples is systematically shallower, so the always-on
+container captures equity itself every five minutes.
 
-A cycle that fails to fill is logged and counted, not retried — the next cycle starts
-clean.
+Each row also stores the running TWR chain `Π(1 + rᵢ)` and the all-time peak.
+That makes two things exact and cheap: resuming after a restart (read the last
+row, carry on), and TWR over any window (`chain_end / chain_start − 1`, no
+recomputation).
+
+    r_i = (E_i − E_{i−1} − flow_i) / E_{i−1}
+
+`flow_i` is the net external cash flow in the interval — deposits, withdrawals,
+journals — ingested from Alpaca activities into **`cash_flows`** so a deposit is
+never mistaken for a profit. `DIV`, `INT` and `FEE` are deliberately excluded:
+they are returns generated *by* the portfolio, not external contributions.
+
+**Gaps are reported, not hidden.** If the process was down and snapshots were
+missed, the next row logs a warning with the gap size — a gap that spans a
+trough silently deletes that drawdown.
+
+**`round_trips`** — the bot's own record of what it *intended* and what came
+back: both order ids, both fill prices, the fee drag. The broker sees two
+unrelated orders; only the container knows they were one trade.
+
+## API
+
+Served on the TradingHost-allocated port, read-only, every data route behind
+`Authorization: Bearer <DASHBOARD_TOKEN>` compared in constant time.
+
+| Route | Returns |
+|---|---|
+| `GET /healthz` | `{ok:true}` — unauthenticated liveness only |
+| `GET /api/performance?since=<ms>&limit=<n>` | `{series, summary}` for the window — the dashboard's main feed |
+| `GET /api/snapshots?since=<ms>&limit=<n>` | Series only |
+| `GET /api/summary?since=<ms>` | Summary only |
+| `GET /api/trades?limit=<n>` | Round trips, newest first |
+| `GET /api/status` | Trader, snapshotter and store counters |
+
+**Window semantics.** TWR over a window is re-based to the snapshot at or before
+the window start via the stored chain. Drawdown within a window is measured from
+the peak *inside* that window — "1D drawdown" should not mean a decline from a
+peak three weeks ago. The all-time figures are returned alongside, labelled.
+
+**Series and summary arrive together** from one read, so a client can never show
+a headline that disagrees with the chart beneath it.
+
+**Security posture, stated plainly.** The port is a plain-HTTP NodePort on a
+public IP. The token stops portscanners and opportunistic reads; it does not
+stop anyone on the network path, who sees the token in the clear. That is an
+acceptable trade for paper money in pre-alpha. For a live account, put TLS in
+front (Cloudflare Tunnel, per TradingHost's own docs) before exposing this.
 
 ## Platform behaviour
 
 - **Logging** — structured JSON to stdout, streamed to the TradingHost console
-- **Shutdown** — on SIGTERM it **flattens any open position** before exiting, well
-  inside the 30-second window, so it never leaves the account holding inventory
-- **Startup** — cancels orphaned orders and flattens any position left by a previous
-  run before trading; never assumes a clean slate
-- **Persistence** — every round trip written to `{TRADINGHOST_DATA_DIR}/state.db`
-  (`round_trips` table: timestamp, order ids, both fill prices, P&L)
-- **Health endpoint** — if the deployment has a port allocated, serves JSON status on
-  `targetPort`: cycles, round trips, failures, last fill prices, cumulative P&L
-
-## Dependencies
-
-None. Standard library plus `requests`, which is pre-installed in the container — so
-deploys are near-instant and memory stays well inside the allocation.
+- **Shutdown** — on SIGTERM the trader flattens any open position before exit,
+  well inside the 30-second window; the API and snapshotter are daemon threads
+- **Startup** — cancels orphaned orders and flattens any leftover position; the
+  snapshotter takes one snapshot immediately to bound the restart gap
+- **Isolation** — a failure in the snapshotter or the API is logged and never
+  reaches the trading loop
+- **Resources** — stdlib plus pre-installed `requests`; nothing to install, so
+  deploys are near-instant and the process stays small inside 512 MB
 
 ## Deploying
 
-Push to `main`. With `trackLatest` on, TradingHost redeploys within seconds via the
-GitHub App webhook (or call `sync_strategy` to trigger the check immediately).
+Push to `main`. TradingHost redeploys within seconds via the GitHub App webhook.
 
-Expect to see, within a minute:
+Expect, within a minute: `Connected to Alpaca paper trading` → `Snapshotter
+started` → `API listening` → `BUY submitted` … `Round trip complete`, then an
+`Equity snapshot` line every five minutes.
 
+## Tests
+
+```bash
+python tests/test_metrics.py
 ```
-Connected to Alpaca paper trading
-Order-path smoke test running
-BUY submitted  → BUY filled  → SELL submitted → SELL filled
-Round trip complete
-```
+
+Pins the invariants: the chain telescopes to simple return with no flows, a
+deposit is not a return, drawdown is never positive and recovers to zero at a new
+peak, window re-basing equals the chain ratio, and the summary is read off the
+series rather than recomputed.

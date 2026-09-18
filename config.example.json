@@ -2,5 +2,7 @@
   "symbol": "BTC/USD",
   "order_qty": 0.001,
   "cycle_seconds": 60,
-  "fill_timeout_seconds": 30
+  "fill_timeout_seconds": 30,
+  "snapshot_seconds": 300,
+  "api_max_points": 2000
 }

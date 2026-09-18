@@ -1,436 +1,133 @@
 #!/usr/bin/env python3
 """
-BTC/USD order-path smoke test - Alpaca paper trading on TradingHost.
+Entry point. Orchestration only - the work lives in the modules:
 
-Opens and closes one position every cycle. This is a CONNECTIVITY TEST, not a
-trading strategy: it deliberately round-trips at market to prove that code
-running inside a TradingHost container can reach Alpaca, place an order, see it
-fill, and close it. It will lose money to the spread by design - never point it
-at anything but a paper account.
+    strategy.py    the round-trip trader (intent + outcome, recorded to SQLite)
+    snapshots.py   5-minute equity snapshots with incremental TWR and drawdown
+    api.py         read-only bearer-token JSON API over the persisted state
+    state.py       SQLite on the persistent volume
+    alpaca.py      the one broker client, shared by everything above
 
 Required TradingHost strategy secrets (environment variables):
     APCA_API_KEY_ID      Alpaca PAPER key id (starts with "PK")
     APCA_API_SECRET_KEY  Alpaca PAPER secret key
+    DASHBOARD_TOKEN      shared secret the dashboard presents to the API
+                         (optional - without it the API stays off and trading
+                         continues)
 
-Non-secret tunables live in config.json, seeded once from config.example.json
-onto the persistent volume so they can be edited without a redeploy.
+Non-secret tunables live in config.json, seeded from config.example.json.
 """
 
 import json
 import os
-import shutil
-import signal
-import sqlite3
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import requests
-
-# ---------------------------------------------------------------------------
-# Platform wiring
-# ---------------------------------------------------------------------------
+from alpaca import Alpaca
+from api import Api
+from config import load_config
+from runtime import install_signal_handlers, log, running, sleep_interruptible
+from snapshots import Snapshotter
+from state import Store
+from strategy import Trader
 
 DATA_DIR = os.environ.get("TRADINGHOST_DATA_DIR", "/data")
 PORTS = json.loads(os.environ.get("TRADINGHOST_PORTS", "[]"))
 
-TRADING_BASE = "https://paper-api.alpaca.markets"
-DATA_BASE = "https://data.alpaca.markets/v1beta3/crypto/us"
-
-TERMINAL_STATES = {"filled", "canceled", "expired", "rejected", "done_for_day"}
-
-running = True
-
-_lock = threading.Lock()
-_status = {
-    "started_at": time.time(),
-    "cycles": 0,
-    "round_trips": 0,
-    "failed_cycles": 0,
-    "last_buy_price": None,
-    "last_sell_price": None,
-    "last_pnl": None,
-    "cumulative_pnl": 0.0,
-    "position_qty": 0.0,
-}
-
-
-def log(level, msg, **kwargs):
-    print(json.dumps({"level": level, "msg": msg, **kwargs}), flush=True)
-
-
-def shutdown(sig, frame):
-    global running
-    if running:
-        log("info", "Shutdown signal received - will flatten and exit")
-    running = False
-
-
-signal.signal(signal.SIGTERM, shutdown)
-signal.signal(signal.SIGINT, shutdown)
-
-
-def sleep_interruptible(seconds):
-    """Sleep in short slices so SIGTERM is honoured well inside the 30s window."""
-    deadline = time.time() + seconds
-    while running and time.time() < deadline:
-        time.sleep(min(1.0, max(0.0, deadline - time.time())))
-
-
-# ---------------------------------------------------------------------------
-# Configuration (non-secret tunables)
-# ---------------------------------------------------------------------------
-
-def load_config():
-    """Load tunables, backfilling any key the persisted copy is missing.
-
-    config.json lives on the persistent volume and is only seeded when absent, so
-    a config written by an earlier version of this strategy will survive a deploy
-    and can be missing keys the new code expects. Merge over the committed
-    defaults rather than trusting it to be complete.
-    """
-    os.makedirs(DATA_DIR, exist_ok=True)
-    path = os.path.join(DATA_DIR, "config.json")
-
-    with open("config.example.json") as fh:
-        defaults = json.load(fh)
-
-    if not os.path.exists(path):
-        shutil.copy("config.example.json", path)
-        log("info", "Seeded config.json from config.example.json", path=path)
-        return defaults
-
-    with open(path) as fh:
-        live = json.load(fh)
-
-    missing = sorted(k for k in defaults if k not in live)
-    if missing:
-        log("warn", "config.json is missing keys - falling back to committed defaults",
-            path=path, missing=missing)
-
-    stale = sorted(k for k in live if k not in defaults)
-    if stale:
-        log("info", "config.json has keys this version ignores", path=path, stale=stale)
-
-    return {**defaults, **live}
-
-
-# ---------------------------------------------------------------------------
-# Alpaca REST
-# ---------------------------------------------------------------------------
-
-class Alpaca:
-    def __init__(self, key_id, secret_key):
-        self.session = requests.Session()
-        self.session.headers.update({
-            "APCA-API-KEY-ID": key_id,
-            "APCA-API-SECRET-KEY": secret_key,
-        })
-
-    def _request(self, method, path, **kwargs):
-        resp = self.session.request(method, TRADING_BASE + path, timeout=15, **kwargs)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"{method} {path} -> {resp.status_code} {resp.text[:200]}")
-        return resp.json() if resp.text else {}
-
-    def account(self):
-        return self._request("GET", "/v2/account")
-
-    def positions(self):
-        return self._request("GET", "/v2/positions")
-
-    def open_orders(self):
-        return self._request("GET", "/v2/orders", params={"status": "open"})
-
-    def get_order(self, order_id):
-        return self._request("GET", f"/v2/orders/{order_id}")
-
-    def cancel_all_orders(self):
-        self.session.delete(TRADING_BASE + "/v2/orders", timeout=15)
-
-    def close_position(self, position_symbol):
-        """Liquidate the whole position. Preferred over selling a computed
-        quantity: Alpaca deducts a trading fee from the filled crypto quantity,
-        so the position is always slightly smaller than the amount ordered."""
-        return self._request("DELETE", f"/v2/positions/{position_symbol}")
-
-    def submit_order(self, symbol, qty, side):
-        return self._request("POST", "/v2/orders", json={
-            "symbol": symbol,
-            "qty": str(qty),
-            "side": side,
-            "type": "market",
-            "time_in_force": "gtc",  # crypto rejects "day"
-        })
-
-
-def find_position(api, symbol):
-    """Return the raw position record, or None. Alpaca reports crypto positions
-    without the slash (BTCUSD, not BTC/USD), so match on the normalised form and
-    hand back whatever spelling the API used - that is what the close endpoint
-    expects."""
-    wanted = symbol.replace("/", "")
-    for pos in api.positions():
-        if pos.get("symbol", "").replace("/", "") == wanted:
-            return pos
-    return None
-
-
-def await_terminal(api, order_id, timeout):
-    """Poll an order until it reaches a terminal state or the timeout expires."""
-    deadline = time.time() + timeout
-    order = api.get_order(order_id)
-    while order.get("status") not in TERMINAL_STATES and time.time() < deadline:
-        time.sleep(1)
-        order = api.get_order(order_id)
-    return order
-
-
-# ---------------------------------------------------------------------------
-# Persistent state
-# ---------------------------------------------------------------------------
-
-def open_db():
-    db = sqlite3.connect(os.path.join(DATA_DIR, "state.db"), check_same_thread=False)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS round_trips (
-            ts            TEXT NOT NULL,
-            symbol        TEXT NOT NULL,
-            qty           REAL NOT NULL,
-            buy_order_id  TEXT,
-            buy_price     REAL,
-            sell_order_id TEXT,
-            sell_price    REAL,
-            pnl           REAL
-        )
-    """)
-    db.commit()
-    return db
-
-
-def record_round_trip(db, symbol, qty, buy, sell, pnl):
-    db.execute(
-        "INSERT INTO round_trips (ts, symbol, qty, buy_order_id, buy_price, "
-        "sell_order_id, sell_price, pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), symbol, qty,
-         buy.get("id"), _price(buy), sell.get("id"), _price(sell), pnl),
-    )
-    db.commit()
-
-
-def _price(order):
-    raw = order.get("filled_avg_price")
-    return float(raw) if raw else None
-
-
-# ---------------------------------------------------------------------------
-# Trading
-# ---------------------------------------------------------------------------
-
-def flatten(api, symbol, timeout, reason):
-    """Close any open position. Used on startup and on shutdown."""
-    pos = find_position(api, symbol)
-    if pos is None:
-        return 0.0
-    qty = float(pos.get("qty", 0))
-    log("warn", "Flattening open position", symbol=pos.get("symbol"),
-        qty=qty, reason=reason)
-    order = api.close_position(pos["symbol"])
-    order = await_terminal(api, order["id"], timeout)
-    log("info", "Flatten complete", symbol=pos.get("symbol"), qty=qty,
-        status=order.get("status"), price=_price(order))
-    return qty
-
-
-def round_trip(api, db, symbol, qty, timeout):
-    """Buy at market, confirm the fill, then close the position straight back out."""
-    buy = api.submit_order(symbol, qty, "buy")
-    log("info", "BUY submitted", symbol=symbol, qty=qty, order_id=buy.get("id"))
-
-    buy = await_terminal(api, buy["id"], timeout)
-    if buy.get("status") != "filled":
-        log("error", "BUY did not fill - skipping cycle",
-            order_id=buy.get("id"), status=buy.get("status"))
-        return False
-
-    buy_price = _price(buy)
-    bought = float(buy.get("filled_qty") or qty)
-    log("info", "BUY filled", symbol=symbol, qty=bought, price=buy_price,
-        order_id=buy.get("id"))
-
-    with _lock:
-        _status["position_qty"] = bought
-        _status["last_buy_price"] = buy_price
-
-    # Close the position rather than selling `bought`: Alpaca deducts its crypto
-    # fee from the filled quantity, so the position is a little smaller than the
-    # amount ordered and selling the ordered size is rejected for insufficient
-    # balance.
-    pos = find_position(api, symbol)
-    if pos is None:
-        log("error", "No position found after a filled buy - cannot close",
-            symbol=symbol, order_id=buy.get("id"))
-        return False
-
-    holding = float(pos.get("qty", 0))
-    sell = api.close_position(pos["symbol"])
-    log("info", "SELL submitted", symbol=pos.get("symbol"), qty=holding,
-        order_id=sell.get("id"))
-
-    sell = await_terminal(api, sell["id"], timeout)
-    if sell.get("status") != "filled":
-        log("error", "SELL did not fill - position may still be open",
-            order_id=sell.get("id"), status=sell.get("status"))
-        return False
-
-    sell_price = _price(sell)
-    sold = float(sell.get("filled_qty") or holding)
-
-    # Value in, value out - this captures the fee drag, which a naive
-    # (sell_price - buy_price) * qty would hide entirely.
-    pnl = None
-    if buy_price and sell_price:
-        pnl = round((sell_price * sold) - (buy_price * bought), 6)
-
-    log("info", "SELL filled", symbol=pos.get("symbol"), qty=sold,
-        price=sell_price, order_id=sell.get("id"))
-    log("info", "Round trip complete", symbol=symbol,
-        bought=bought, sold=sold, fee_drag=round(bought - sold, 10),
-        buy_price=buy_price, sell_price=sell_price, pnl=pnl)
-
-    record_round_trip(db, symbol, sold, buy, sell, pnl)
-
-    with _lock:
-        _status["position_qty"] = 0.0
-        _status["last_sell_price"] = sell_price
-        _status["last_pnl"] = pnl
-        _status["round_trips"] += 1
-        if pnl is not None:
-            _status["cumulative_pnl"] = round(_status["cumulative_pnl"] + pnl, 6)
-
-    return True
-
-
-# ---------------------------------------------------------------------------
-# Optional health endpoint
-# ---------------------------------------------------------------------------
-
-def start_health_server():
-    if not PORTS:
-        log("info", "No ports allocated - health endpoint disabled")
-        return
-    port = PORTS[0]["targetPort"]
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            with _lock:
-                body = dict(_status)
-            body["uptime_seconds"] = round(time.time() - body["started_at"], 1)
-            body["status"] = "ok"
-            payload = json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *args):
-            pass  # suppress default stderr access logging
-
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log("info", "Health endpoint listening", port=port, path="/health")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     key_id = os.environ.get("APCA_API_KEY_ID")
     secret_key = os.environ.get("APCA_API_SECRET_KEY")
+    dashboard_token = os.environ.get("DASHBOARD_TOKEN")
 
     if not key_id or not secret_key:
-        log("error", "Missing credentials - set APCA_API_KEY_ID and APCA_API_SECRET_KEY "
-                     "as TradingHost strategy secrets, then redeploy (a restart will not "
-                     "pick up new secrets)")
+        log("error", "Missing credentials - set APCA_API_KEY_ID and APCA_API_SECRET_KEY as "
+                     "TradingHost strategy secrets, then redeploy (a restart will not pick up "
+                     "new secrets)")
         return 1
 
     if not key_id.startswith("PK"):
         log("error", "Refusing to start: APCA_API_KEY_ID does not look like a paper key",
-            hint="Paper keys begin with PK, live keys begin with AK. This strategy "
-                 "round-trips continuously and must never touch a live account.")
+            hint="Paper keys begin with PK, live keys begin with AK. This strategy round-trips "
+                 "continuously and must never touch a live account.")
         return 1
 
-    config = load_config()
-    symbol = config["symbol"]
-    qty = config["order_qty"]
-    cycle_seconds = config["cycle_seconds"]
-    fill_timeout = config["fill_timeout_seconds"]
+    install_signal_handlers()
+    config = load_config(DATA_DIR)
 
     api = Alpaca(key_id, secret_key)
-    db = open_db()
-    start_health_server()
+    store = Store(DATA_DIR)
+    trader = Trader(api, store, config["symbol"], config["order_qty"], config["fill_timeout_seconds"])
+    snapshotter = Snapshotter(api, store, config["snapshot_seconds"])
 
     try:
         account = api.account()
         log("info", "Connected to Alpaca paper trading",
-            account_number=account.get("account_number"),
-            status=account.get("status"),
-            buying_power=account.get("buying_power"),
-            currency=account.get("currency"))
-
-        stale = api.open_orders()
-        if stale:
-            api.cancel_all_orders()
-            log("warn", "Cancelled orphaned open orders from a previous run",
-                count=len(stale))
-
-        flatten(api, symbol, fill_timeout, reason="startup reconciliation")
+            account_number=account.get("account_number"), status=account.get("status"),
+            buying_power=account.get("buying_power"), currency=account.get("currency"))
+        trader.reconcile()
     except Exception as exc:
-        log("error", "Could not reach Alpaca paper trading - refusing to start",
-            error=str(exc),
-            hint="A 401 means the key or secret is wrong, was regenerated (which "
-                 "invalidates the previous pair), or belongs to the live account. "
-                 "Generate fresh paper keys at app.alpaca.markets, update the "
-                 "strategy secrets, then REDEPLOY - a restart keeps the old "
-                 "environment and will not pick them up.")
-        db.close()
+        log("error", "Could not reach Alpaca paper trading - refusing to start", error=str(exc),
+            hint="A 401 means the key or secret is wrong, was regenerated (which invalidates the "
+                 "previous pair), or belongs to the live account. Generate fresh paper keys, "
+                 "update the strategy secrets, then REDEPLOY - a restart keeps the old environment.")
+        store.close()
         return 1
 
+    # --- background workers -------------------------------------------------
+    # Both run on daemon threads and neither can take trading down with it.
+
+    threading.Thread(target=snapshotter.run, name="snapshotter", daemon=True).start()
+    log("info", "Snapshotter started", interval_seconds=config["snapshot_seconds"],
+        store=store.counts())
+
+    api_server = None
+    if not PORTS:
+        log("warn", "No port allocated - dashboard API disabled",
+            hint="Allocate a port on the deployment to expose the read-only API.")
+    elif not dashboard_token:
+        log("warn", "DASHBOARD_TOKEN not set - dashboard API disabled",
+            hint="Set DASHBOARD_TOKEN as a strategy secret and redeploy to enable it.")
+    else:
+        try:
+            api_server = Api(store, trader, snapshotter, dashboard_token,
+                             PORTS[0]["targetPort"], config["api_max_points"])
+            api_server.serve_forever_in_thread()
+            log("info", "Dashboard API reachable at",
+                url=f"http://{PORTS[0].get('publicIp', '<publicIp>')}:{PORTS[0]['nodePort']}")
+        except Exception as exc:
+            log("error", "Dashboard API failed to start - trading continues without it", error=str(exc))
+
+    # --- trading loop -------------------------------------------------------
+
     log("info", "Order-path smoke test running",
-        symbol=symbol, order_qty=qty, cycle_seconds=cycle_seconds,
+        symbol=config["symbol"], order_qty=config["order_qty"],
+        cycle_seconds=config["cycle_seconds"],
         note="Opens and closes one position per cycle. Paper only - loses to spread by design.")
 
-    while running:
-        cycle_started = time.time()
-        with _lock:
-            _status["cycles"] += 1
-
+    while running():
+        started = time.time()
         try:
-            if not round_trip(api, db, symbol, qty, fill_timeout):
-                with _lock:
-                    _status["failed_cycles"] += 1
+            trader.round_trip()
         except Exception as exc:
-            with _lock:
-                _status["failed_cycles"] += 1
+            trader._fail()
             log("error", "Cycle failed", error=str(exc))
+        sleep_interruptible(max(0.0, config["cycle_seconds"] - (time.time() - started)))
 
-        elapsed = time.time() - cycle_started
-        sleep_interruptible(max(0.0, cycle_seconds - elapsed))
+    # --- shutdown -----------------------------------------------------------
 
     try:
-        flatten(api, symbol, fill_timeout, reason="shutdown")
+        trader.flatten(reason="shutdown")
     except Exception as exc:
         log("error", "Could not flatten on shutdown", error=str(exc))
+    if api_server:
+        api_server.shutdown()
 
-    with _lock:
-        summary = dict(_status)
-    log("info", "Stopped cleanly",
-        cycles=summary["cycles"], round_trips=summary["round_trips"],
-        failed_cycles=summary["failed_cycles"],
-        cumulative_pnl=summary["cumulative_pnl"])
-    db.close()
+    summary = trader.status()
+    log("info", "Stopped cleanly", cycles=summary["cycles"], round_trips=summary["round_trips"],
+        failed_cycles=summary["failed_cycles"], cumulative_pnl=summary["cumulative_pnl"],
+        snapshots=snapshotter.status())
+    store.close()
     return 0
 
 
