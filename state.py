@@ -105,9 +105,17 @@ class Store:
         return dict(row) if row else None
 
     def insert_snapshot(self, row):
+        """Plain INSERT, deliberately not INSERT OR REPLACE.
+
+        A snapshot is immutable history. Two rows sharing a millisecond must
+        never collapse into one - that silently deletes whatever happened in
+        the earlier row, which for drawdown means deleting the trough. The
+        snapshotter guarantees strictly increasing timestamps; if that ever
+        fails, a loud IntegrityError is the correct outcome, not a quiet
+        overwrite."""
         with self._lock:
             self.db.execute(
-                "INSERT OR REPLACE INTO equity_snapshots (ts, equity, cash, buying_power, "
+                "INSERT INTO equity_snapshots (ts, equity, cash, buying_power, "
                 "long_market_value, flow, chain, twr, peak, drawdown) "
                 "VALUES (:ts, :equity, :cash, :buying_power, :long_market_value, "
                 ":flow, :chain, :twr, :peak, :drawdown)",

@@ -120,6 +120,14 @@ class Snapshotter:
             self.taken += 1
             return row
 
+        # Timestamps must be strictly increasing: the store refuses duplicates
+        # rather than overwriting, because an overwrite would erase a snapshot.
+        # A 1 ms nudge is irrelevant at a 5-minute cadence and only ever fires
+        # when the wall clock has not advanced between two takes (coarse clocks,
+        # tight test loops).
+        if now <= prev["ts"]:
+            now = prev["ts"] + 1
+
         gap_ms = now - prev["ts"]
         if gap_ms > 2 * self.interval * 1000:
             log("warn", "Gap in equity snapshots - drawdown across this gap is unobservable",

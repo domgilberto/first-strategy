@@ -16,7 +16,6 @@ These pin down the properties that make the numbers trustworthy:
 import os
 import sys
 import tempfile
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,15 +61,32 @@ class ChainTests(unittest.TestCase):
     def test_deposit_is_not_a_return(self):
         store = make_store()
         # Equity 100 -> 150, but 50 of that arrived as a deposit: TWR must be 0.
-        now = int(time.time() * 1000)
-        store.upsert_cash_flows([{"id": "dep1", "ts": now + 1, "type": "CSD", "amount": 50.0}])
         snap = Snapshotter(FakeAlpaca([100.0, 150.0]), store, 300)
         snap.take()
-        time.sleep(0.01)  # ensure the deposit ts falls inside (prev.ts, now]
+        # Anchor the deposit to the stored row rather than the wall clock, so
+        # the test does not depend on clock resolution. The snapshotter
+        # guarantees the next ts is strictly greater, so (prev, next] holds it.
+        first_ts = store.last_snapshot()["ts"]
+        store.upsert_cash_flows([{"id": "dep1", "ts": first_ts + 1, "type": "CSD", "amount": 50.0}])
         snap.take()
         last = store.last_snapshot()
         self.assertAlmostEqual(last["twr"], 0.0, places=9)
         self.assertEqual(last["flow"], 50.0)
+        store.close()
+
+    def test_same_millisecond_takes_never_collapse(self):
+        """Regression: on coarse clocks two takes can share a millisecond. The
+        store must keep both rows - an overwrite would erase a trough."""
+        store = make_store()
+        eq = [100.0, 90.0, 95.0]
+        snap = Snapshotter(FakeAlpaca(eq), store, 300)
+        for _ in eq:
+            snap.take()  # no sleep: deliberately as fast as possible
+        rows = store.snapshots_since(0)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([r["equity"] for r in rows], eq)
+        ts = [r["ts"] for r in rows]
+        self.assertTrue(all(b > a for a, b in zip(ts, ts[1:])), "timestamps must strictly increase")
         store.close()
 
     def test_drawdown_bounds_and_recovery(self):
