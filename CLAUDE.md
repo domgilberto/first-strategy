@@ -36,7 +36,7 @@ pre-installed — do **not** list them in `requirements.txt`, it only slows depl
 Never depend on `TA-Lib` / `import talib`; the C library is absent and cannot be
 installed in the non-root container. Use pure-Python `ta` or `pandas-ta` instead.
 
-The deployment has **256 MB** of memory. Prefer stdlib and `requests` over heavyweight
+The deployment currently has **512 MB** of memory (check `get_deployment` rather than the console for the live figure). Prefer stdlib and `requests` over heavyweight
 SDKs; keep the dependency list empty where possible.
 
 ## Restart safety

@@ -1,81 +1,89 @@
 # first-strategy
 
-A BTC/USD SMA-crossover bot running on [TradingHost](https://app.tradinghost.com)
+A BTC/USD **order-path smoke test** running on [TradingHost](https://app.tradinghost.com)
 against [Alpaca](https://alpaca.markets) **paper** trading.
 
-Built as an end-to-end pipeline test: write the strategy in Claude, push to GitHub,
-watch TradingHost redeploy it into a container automatically.
+## What this is — and isn't
 
-## Why BTC/USD
+It opens and closes one position every cycle, at market. That is the entire logic.
 
-Crypto trades 24/7 on Alpaca, so the bot produces observable activity the moment it
-deploys — regardless of the hour or day. A US equities strategy would sit idle outside
-market hours, making "working" indistinguishable from "broken".
+This is a **connectivity test, not a trading strategy**. It exists to prove that code
+running inside a TradingHost container can reach Alpaca, place an order, observe the
+fill, and close the position — and that the whole loop (write in Claude → push to
+GitHub → redeploy → execute) works end to end.
+
+It round-trips at market every minute, so it pays the spread twice per cycle and will
+steadily lose money by design. **Never point it at a live account.** The process
+refuses to start on a key that does not begin with `PK`.
 
 ## Required secrets
 
-Set these as **TradingHost strategy secrets** (they arrive as environment variables).
-Never put them in `config.json` or commit them.
+Set as **TradingHost strategy secrets** — they arrive as environment variables. Never
+put them in `config.json`.
 
 | Variable | Value |
 |---|---|
 | `APCA_API_KEY_ID` | Alpaca **paper** key id — begins with `PK` |
 | `APCA_API_SECRET_KEY` | Alpaca **paper** secret key |
 
-Generate them at **app.alpaca.markets** → switch the account selector to **Paper
-Trading** → *API Keys* panel → *Generate New Key*. The secret is shown exactly once.
-
 > Changing a secret requires a **redeploy**, not a restart. A restart-in-place keeps
 > the old environment and will not pick up the new value.
 
-The strategy refuses to start if the key does not begin with `PK`, and only ever talks
-to `paper-api.alpaca.markets`. There is no code path to live trading.
-
 ## Tunables
 
-Non-secret settings live in `config.example.json`, seeded once to
-`{TRADINGHOST_DATA_DIR}/config.json` on the persistent volume — edit it there to
-change behaviour without redeploying code.
+`config.example.json` is committed; it is seeded once to
+`{TRADINGHOST_DATA_DIR}/config.json` on the persistent volume, where you can edit it
+without redeploying code.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `symbol` | `BTC/USD` | Alpaca crypto pair |
-| `timeframe` | `1Min` | Bar size for the moving averages |
-| `fast_sma` | `9` | Fast moving-average window |
-| `slow_sma` | `21` | Slow moving-average window |
-| `order_qty` | `0.001` | Order size in BTC (~$78 at current prices) |
-| `poll_seconds` | `60` | Seconds between evaluation cycles |
+| `symbol` | `BTC/USD` | Alpaca crypto pair (24/7, so it trades at any hour) |
+| `order_qty` | `0.001` | Order size in BTC |
+| `cycle_seconds` | `60` | Seconds between round trips |
+| `fill_timeout_seconds` | `30` | How long to wait for an order to reach a terminal state |
 
-## Logic
+Because the persisted copy survives deploys, it can be missing keys a newer version
+expects. The loader merges it over the committed defaults and logs both the missing
+keys and any it no longer uses, rather than crashing.
 
-Each cycle: fetch the most recent bars, compute the fast and slow SMAs, and hold a
-long position whenever fast > slow.
+## Cycle
 
-- fast crosses **above** slow while flat → market **buy** `order_qty`
-- fast crosses **below** slow while long → market **sell** the whole position
+1. Market **buy** `order_qty`
+2. Poll the order until it reaches a terminal state
+3. Market **sell** the filled quantity back
+4. Poll again, log both fill prices and the realised P&L
+5. Record the round trip in SQLite, sleep until the next cycle
 
-Deliberately simple. The point of this repo is to prove the deploy pipeline, not to
-make money — an SMA crossover on 1-minute bars will churn and lose to fees in any
-real setting.
+A cycle that fails to fill is logged and counted, not retried — the next cycle starts
+clean.
 
 ## Platform behaviour
 
 - **Logging** — structured JSON to stdout, streamed to the TradingHost console
-- **Shutdown** — SIGTERM handled, current cycle finishes well inside the 30s window
-- **Persistence** — fills recorded in SQLite at `{TRADINGHOST_DATA_DIR}/state.db`
-- **Restart safety** — on boot it queries Alpaca for the real position and cancels
-  orphaned orders rather than trusting local state
+- **Shutdown** — on SIGTERM it **flattens any open position** before exiting, well
+  inside the 30-second window, so it never leaves the account holding inventory
+- **Startup** — cancels orphaned orders and flattens any position left by a previous
+  run before trading; never assumes a clean slate
+- **Persistence** — every round trip written to `{TRADINGHOST_DATA_DIR}/state.db`
+  (`round_trips` table: timestamp, order ids, both fill prices, P&L)
 - **Health endpoint** — if the deployment has a port allocated, serves JSON status on
-  `targetPort` (uptime, last price, last signal, position, order count, error count)
+  `targetPort`: cycles, round trips, failures, last fill prices, cumulative P&L
 
 ## Dependencies
 
-None. Standard library plus `requests`, which is pre-installed in the container —
-so deploys are near-instant and memory stays well inside the 256 MB allocation.
+None. Standard library plus `requests`, which is pre-installed in the container — so
+deploys are near-instant and memory stays well inside the allocation.
 
 ## Deploying
 
-1. Push to `main`
-2. TradingHost redeploys within seconds via the GitHub App webhook
-3. Watch the console — you should see `Connected to Alpaca paper trading`, then a
-   `Tick` line every 60 seconds
+Push to `main`. With `trackLatest` on, TradingHost redeploys within seconds via the
+GitHub App webhook (or call `sync_strategy` to trigger the check immediately).
+
+Expect to see, within a minute:
+
+```
+Connected to Alpaca paper trading
+Order-path smoke test running
+BUY submitted  → BUY filled  → SELL submitted → SELL filled
+Round trip complete
+```

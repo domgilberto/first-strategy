@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-BTC/USD SMA-crossover strategy - Alpaca paper trading on TradingHost.
+BTC/USD order-path smoke test - Alpaca paper trading on TradingHost.
 
-Dependency-free by design: uses only the Python standard library plus `requests`,
-which is pre-installed in the TradingHost container. Nothing to install means
-near-instant deploys and a resident set comfortably inside the 256 MB allocation.
+Opens and closes one position every cycle. This is a CONNECTIVITY TEST, not a
+trading strategy: it deliberately round-trips at market to prove that code
+running inside a TradingHost container can reach Alpaca, place an order, see it
+fill, and close it. It will lose money to the spread by design - never point it
+at anything but a paper account.
 
 Required TradingHost strategy secrets (environment variables):
     APCA_API_KEY_ID      Alpaca PAPER key id (starts with "PK")
@@ -35,18 +37,21 @@ PORTS = json.loads(os.environ.get("TRADINGHOST_PORTS", "[]"))
 TRADING_BASE = "https://paper-api.alpaca.markets"
 DATA_BASE = "https://data.alpaca.markets/v1beta3/crypto/us"
 
+TERMINAL_STATES = {"filled", "canceled", "expired", "rejected", "done_for_day"}
+
 running = True
 
 _lock = threading.Lock()
 _status = {
     "started_at": time.time(),
-    "last_price": None,
-    "last_signal": None,
-    "fast_sma": None,
-    "slow_sma": None,
+    "cycles": 0,
+    "round_trips": 0,
+    "failed_cycles": 0,
+    "last_buy_price": None,
+    "last_sell_price": None,
+    "last_pnl": None,
+    "cumulative_pnl": 0.0,
     "position_qty": 0.0,
-    "orders_submitted": 0,
-    "errors": 0,
 }
 
 
@@ -57,7 +62,7 @@ def log(level, msg, **kwargs):
 def shutdown(sig, frame):
     global running
     if running:
-        log("info", "Shutdown signal received, finishing current cycle")
+        log("info", "Shutdown signal received - will flatten and exit")
     running = False
 
 
@@ -77,13 +82,37 @@ def sleep_interruptible(seconds):
 # ---------------------------------------------------------------------------
 
 def load_config():
+    """Load tunables, backfilling any key the persisted copy is missing.
+
+    config.json lives on the persistent volume and is only seeded when absent, so
+    a config written by an earlier version of this strategy will survive a deploy
+    and can be missing keys the new code expects. Merge over the committed
+    defaults rather than trusting it to be complete.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     path = os.path.join(DATA_DIR, "config.json")
+
+    with open("config.example.json") as fh:
+        defaults = json.load(fh)
+
     if not os.path.exists(path):
         shutil.copy("config.example.json", path)
         log("info", "Seeded config.json from config.example.json", path=path)
+        return defaults
+
     with open(path) as fh:
-        return json.load(fh)
+        live = json.load(fh)
+
+    missing = sorted(k for k in defaults if k not in live)
+    if missing:
+        log("warn", "config.json is missing keys - falling back to committed defaults",
+            path=path, missing=missing)
+
+    stale = sorted(k for k in live if k not in defaults)
+    if stale:
+        log("info", "config.json has keys this version ignores", path=path, stale=stale)
+
+    return {**defaults, **live}
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +142,9 @@ class Alpaca:
     def open_orders(self):
         return self._request("GET", "/v2/orders", params={"status": "open"})
 
+    def get_order(self, order_id):
+        return self._request("GET", f"/v2/orders/{order_id}")
+
     def cancel_all_orders(self):
         self.session.delete(TRADING_BASE + "/v2/orders", timeout=15)
 
@@ -126,22 +158,22 @@ class Alpaca:
         })
 
 
-def fetch_closes(symbol, timeframe, limit):
-    """Crypto market data is public - no credentials required."""
-    resp = requests.get(
-        f"{DATA_BASE}/bars",
-        params={"symbols": symbol, "timeframe": timeframe, "limit": limit},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    bars = resp.json().get("bars", {}).get(symbol, [])
-    return [bar["c"] for bar in bars]
+def position_qty(api, symbol):
+    wanted = symbol.replace("/", "")
+    for pos in api.positions():
+        if pos.get("symbol", "").replace("/", "") == wanted:
+            return float(pos.get("qty", 0))
+    return 0.0
 
 
-def sma(values, window):
-    if len(values) < window:
-        return None
-    return sum(values[-window:]) / window
+def await_terminal(api, order_id, timeout):
+    """Poll an order until it reaches a terminal state or the timeout expires."""
+    deadline = time.time() + timeout
+    order = api.get_order(order_id)
+    while order.get("status") not in TERMINAL_STATES and time.time() < deadline:
+        time.sleep(1)
+        order = api.get_order(order_id)
+    return order
 
 
 # ---------------------------------------------------------------------------
@@ -151,43 +183,101 @@ def sma(values, window):
 def open_db():
     db = sqlite3.connect(os.path.join(DATA_DIR, "state.db"), check_same_thread=False)
     db.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            ts       TEXT NOT NULL,
-            symbol   TEXT NOT NULL,
-            side     TEXT NOT NULL,
-            qty      REAL NOT NULL,
-            price    REAL,
-            order_id TEXT
+        CREATE TABLE IF NOT EXISTS round_trips (
+            ts            TEXT NOT NULL,
+            symbol        TEXT NOT NULL,
+            qty           REAL NOT NULL,
+            buy_order_id  TEXT,
+            buy_price     REAL,
+            sell_order_id TEXT,
+            sell_price    REAL,
+            pnl           REAL
         )
     """)
     db.commit()
     return db
 
 
-def record_trade(db, symbol, side, qty, price, order_id):
+def record_round_trip(db, symbol, qty, buy, sell, pnl):
     db.execute(
-        "INSERT INTO trades (ts, symbol, side, qty, price, order_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), symbol, side, qty, price, order_id),
+        "INSERT INTO round_trips (ts, symbol, qty, buy_order_id, buy_price, "
+        "sell_order_id, sell_price, pnl) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), symbol, qty,
+         buy.get("id"), _price(buy), sell.get("id"), _price(sell), pnl),
     )
     db.commit()
 
 
-def reconcile(api, symbol):
-    """Never trust local state after a restart - ask the broker what is actually held."""
-    wanted = symbol.replace("/", "")
-    qty = 0.0
-    for pos in api.positions():
-        if pos.get("symbol", "").replace("/", "") == wanted:
-            qty = float(pos.get("qty", 0))
-            break
+def _price(order):
+    raw = order.get("filled_avg_price")
+    return float(raw) if raw else None
 
-    stale = api.open_orders()
-    if stale:
-        api.cancel_all_orders()
-        log("warn", "Cancelled orphaned open orders from a previous run", count=len(stale))
 
-    log("info", "Reconciled with broker", symbol=symbol, position_qty=qty)
+# ---------------------------------------------------------------------------
+# Trading
+# ---------------------------------------------------------------------------
+
+def flatten(api, symbol, timeout, reason):
+    """Close any open position. Used on startup and on shutdown."""
+    qty = position_qty(api, symbol)
+    if qty <= 0:
+        return 0.0
+    log("warn", "Flattening open position", symbol=symbol, qty=qty, reason=reason)
+    order = api.submit_order(symbol, qty, "sell")
+    order = await_terminal(api, order["id"], timeout)
+    log("info", "Flatten complete", symbol=symbol, qty=qty,
+        status=order.get("status"), price=_price(order))
     return qty
+
+
+def round_trip(api, db, symbol, qty, timeout):
+    """Buy at market, confirm the fill, then sell it straight back."""
+    buy = api.submit_order(symbol, qty, "buy")
+    log("info", "BUY submitted", symbol=symbol, qty=qty, order_id=buy.get("id"))
+
+    buy = await_terminal(api, buy["id"], timeout)
+    if buy.get("status") != "filled":
+        log("error", "BUY did not fill - skipping cycle",
+            order_id=buy.get("id"), status=buy.get("status"))
+        return False
+
+    buy_price = _price(buy)
+    filled = float(buy.get("filled_qty") or qty)
+    log("info", "BUY filled", symbol=symbol, qty=filled, price=buy_price,
+        order_id=buy.get("id"))
+
+    with _lock:
+        _status["position_qty"] = filled
+        _status["last_buy_price"] = buy_price
+
+    sell = api.submit_order(symbol, filled, "sell")
+    log("info", "SELL submitted", symbol=symbol, qty=filled, order_id=sell.get("id"))
+
+    sell = await_terminal(api, sell["id"], timeout)
+    if sell.get("status") != "filled":
+        log("error", "SELL did not fill - position may still be open",
+            order_id=sell.get("id"), status=sell.get("status"))
+        return False
+
+    sell_price = _price(sell)
+    pnl = round((sell_price - buy_price) * filled, 6) if buy_price and sell_price else None
+
+    log("info", "SELL filled", symbol=symbol, qty=filled, price=sell_price,
+        order_id=sell.get("id"))
+    log("info", "Round trip complete", symbol=symbol, qty=filled,
+        buy_price=buy_price, sell_price=sell_price, pnl=pnl)
+
+    record_round_trip(db, symbol, filled, buy, sell, pnl)
+
+    with _lock:
+        _status["position_qty"] = 0.0
+        _status["last_sell_price"] = sell_price
+        _status["last_pnl"] = pnl
+        _status["round_trips"] += 1
+        if pnl is not None:
+            _status["cumulative_pnl"] = round(_status["cumulative_pnl"] + pnl, 6)
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -237,17 +327,15 @@ def main():
 
     if not key_id.startswith("PK"):
         log("error", "Refusing to start: APCA_API_KEY_ID does not look like a paper key",
-            hint="Paper keys begin with PK, live keys begin with AK. This strategy only "
-                 "ever talks to paper-api.alpaca.markets.")
+            hint="Paper keys begin with PK, live keys begin with AK. This strategy "
+                 "round-trips continuously and must never touch a live account.")
         return 1
 
     config = load_config()
     symbol = config["symbol"]
-    timeframe = config["timeframe"]
-    fast_window = config["fast_sma"]
-    slow_window = config["slow_sma"]
     qty = config["order_qty"]
-    interval = config["poll_seconds"]
+    cycle_seconds = config["cycle_seconds"]
+    fill_timeout = config["fill_timeout_seconds"]
 
     api = Alpaca(key_id, secret_key)
     db = open_db()
@@ -260,7 +348,14 @@ def main():
             status=account.get("status"),
             buying_power=account.get("buying_power"),
             currency=account.get("currency"))
-        position_qty = reconcile(api, symbol)
+
+        stale = api.open_orders()
+        if stale:
+            api.cancel_all_orders()
+            log("warn", "Cancelled orphaned open orders from a previous run",
+                count=len(stale))
+
+        flatten(api, symbol, fill_timeout, reason="startup reconciliation")
     except Exception as exc:
         log("error", "Could not reach Alpaca paper trading - refusing to start",
             error=str(exc),
@@ -272,68 +367,38 @@ def main():
         db.close()
         return 1
 
-    with _lock:
-        _status["position_qty"] = position_qty
-
-    log("info", "Strategy running",
-        symbol=symbol, timeframe=timeframe,
-        fast_sma=fast_window, slow_sma=slow_window,
-        order_qty=qty, poll_seconds=interval)
+    log("info", "Order-path smoke test running",
+        symbol=symbol, order_qty=qty, cycle_seconds=cycle_seconds,
+        note="Opens and closes one position per cycle. Paper only - loses to spread by design.")
 
     while running:
+        cycle_started = time.time()
+        with _lock:
+            _status["cycles"] += 1
+
         try:
-            closes = fetch_closes(symbol, timeframe, slow_window + 5)
-            fast = sma(closes, fast_window)
-            slow = sma(closes, slow_window)
-
-            if fast is None or slow is None:
-                log("warn", "Not enough bars yet", have=len(closes), need=slow_window)
-                sleep_interruptible(interval)
-                continue
-
-            price = closes[-1]
-            signal_name = "long" if fast > slow else "flat"
-
-            with _lock:
-                _status.update({
-                    "last_price": price,
-                    "last_signal": signal_name,
-                    "fast_sma": round(fast, 2),
-                    "slow_sma": round(slow, 2),
-                })
-
-            log("info", "Tick", symbol=symbol, price=price,
-                fast_sma=round(fast, 2), slow_sma=round(slow, 2),
-                signal=signal_name, position_qty=position_qty)
-
-            if signal_name == "long" and position_qty == 0:
-                order = api.submit_order(symbol, qty, "buy")
-                position_qty = qty
-                record_trade(db, symbol, "buy", qty, price, order.get("id"))
+            if not round_trip(api, db, symbol, qty, fill_timeout):
                 with _lock:
-                    _status["position_qty"] = position_qty
-                    _status["orders_submitted"] += 1
-                log("info", "BUY submitted", symbol=symbol, qty=qty,
-                    price=price, order_id=order.get("id"))
-
-            elif signal_name == "flat" and position_qty > 0:
-                order = api.submit_order(symbol, position_qty, "sell")
-                record_trade(db, symbol, "sell", position_qty, price, order.get("id"))
-                log("info", "SELL submitted", symbol=symbol, qty=position_qty,
-                    price=price, order_id=order.get("id"))
-                position_qty = 0.0
-                with _lock:
-                    _status["position_qty"] = 0.0
-                    _status["orders_submitted"] += 1
-
+                    _status["failed_cycles"] += 1
         except Exception as exc:
             with _lock:
-                _status["errors"] += 1
+                _status["failed_cycles"] += 1
             log("error", "Cycle failed", error=str(exc))
 
-        sleep_interruptible(interval)
+        elapsed = time.time() - cycle_started
+        sleep_interruptible(max(0.0, cycle_seconds - elapsed))
 
-    log("info", "Stopped cleanly", position_qty=position_qty)
+    try:
+        flatten(api, symbol, fill_timeout, reason="shutdown")
+    except Exception as exc:
+        log("error", "Could not flatten on shutdown", error=str(exc))
+
+    with _lock:
+        summary = dict(_status)
+    log("info", "Stopped cleanly",
+        cycles=summary["cycles"], round_trips=summary["round_trips"],
+        failed_cycles=summary["failed_cycles"],
+        cumulative_pnl=summary["cumulative_pnl"])
     db.close()
     return 0
 

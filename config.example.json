@@ -1,8 +1,6 @@
 {
   "symbol": "BTC/USD",
-  "timeframe": "1Min",
-  "fast_sma": 9,
-  "slow_sma": 21,
   "order_qty": 0.001,
-  "poll_seconds": 60
+  "cycle_seconds": 60,
+  "fill_timeout_seconds": 30
 }
