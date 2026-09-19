@@ -114,7 +114,7 @@ used, so an older config never crashes a newer version.
 | Key | Default | Meaning |
 |---|---|---|
 | `poll_seconds` | `20` | Engine cadence: order sync, stop check, take-profit decay |
-| `bars.timeframe` / `lookback` | `1Hour` / `200` | Bars for ATR; refreshed every `refresh_seconds` |
+| `bars.timeframe` / `lookback` | `1Hour` / `200` | Newest bars for ATR (requested with an explicit window and paged - Alpaca's default `start` is midnight UTC today); refreshed every `refresh_seconds` |
 | `atr_period` | `14` | Wilder ATR period |
 | `grid.max_levels` | `6` | Safety levels below the base order |
 | `grid.spacing_atr` / `spacing_scale` | `0.6` / `1.2` | First gap in ATR, then geometric widening |

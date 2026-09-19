@@ -456,6 +456,10 @@ class SoftwareTakeProfitTests(EngineCase):
         self.assertGreater(c["pnl"], 0)
         self.assertClean(eng)   # a handled fallback is not an engine error
 
+
+class BrokerWireTests(unittest.TestCase):
+    """What goes over the wire to Alpaca - formatting and market-data requests."""
+
     def test_quantity_formatting_floors_never_rounds(self):
         from alpaca import fmt_qty
         self.assertEqual(fmt_qty(0.0156607500), "0.01566075")
@@ -465,6 +469,67 @@ class SoftwareTakeProfitTests(EngineCase):
         self.assertEqual(fmt_qty(0.0156607509999), "0.01566075")
         self.assertEqual(fmt_qty(1.0), "1")
         self.assertEqual(fmt_qty(0), "0")
+
+    def test_timeframe_seconds(self):
+        from alpaca import timeframe_seconds
+        self.assertEqual(timeframe_seconds("1Min"), 60)
+        self.assertEqual(timeframe_seconds("15Min"), 900)
+        self.assertEqual(timeframe_seconds("1Hour"), 3600)
+        self.assertEqual(timeframe_seconds("4H"), 14400)
+        self.assertEqual(timeframe_seconds("1Day"), 86400)
+        with self.assertRaises(ValueError):
+            timeframe_seconds("hourly")
+
+    def test_fetch_bars_asks_for_the_newest_window_and_pages_to_the_limit(self):
+        """Alpaca defaults `start` to midnight UTC today, which leaves the ATR
+        undefined for most of every day. The request must pin its own window,
+        newest first, and keep paging until it holds `limit` bars."""
+        import alpaca
+
+        calls = []
+        pages = [
+            ({"bars": {"BTC/USD": [{"t": f"2026-09-19T{h:02d}:00:00Z"} for h in range(19, 9, -1)]},
+              "next_page_token": "p2"}),
+            ({"bars": {"BTC/USD": [{"t": f"2026-09-19T{h:02d}:00:00Z"} for h in range(9, -1, -1)]},
+              "next_page_token": "p3"}),
+        ]
+
+        class Resp:
+            def __init__(self, body):
+                self._body = body
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self._body
+
+        def fake_get(url, params, timeout):
+            calls.append(dict(params))
+            return Resp(pages[len(calls) - 1])
+
+        real_get = alpaca.requests.get
+        alpaca.requests.get = fake_get
+        try:
+            bars = alpaca.Alpaca("PKtest", "secret").fetch_bars("BTC/USD", "1Hour", 15)
+        finally:
+            alpaca.requests.get = real_get
+
+        self.assertEqual(len(calls), 2, "stops paging once it has `limit` bars")
+        first = calls[0]
+        self.assertEqual(first["sort"], "desc")
+        self.assertEqual(first["limit"], 15)
+        self.assertNotIn("page_token", first)
+        # The window opens well before the newest `limit` bars could begin.
+        from datetime import datetime, timedelta, timezone
+        start = datetime.strptime(first["start"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        self.assertLess(start, datetime.now(timezone.utc) - timedelta(hours=15))
+        self.assertEqual(calls[1]["page_token"], "p2")
+
+        self.assertEqual(len(bars), 15, "trimmed to the newest `limit` bars")
+        self.assertEqual([b["t"] for b in bars], sorted(b["t"] for b in bars), "ascending")
+        self.assertEqual(bars[-1]["t"], "2026-09-19T19:00:00Z")
+        self.assertEqual(bars[0]["t"], "2026-09-19T05:00:00Z")
 
 
 class MarkoutTests(EngineCase):

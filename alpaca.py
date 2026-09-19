@@ -10,12 +10,33 @@ needs no credentials; it is exposed as methods here anyway so the engine has
 one object to talk to and tests can substitute a fake broker wholesale.
 """
 
+import re
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 
 import requests
 
 TRADING_BASE = "https://paper-api.alpaca.markets"
 DATA_BASE = "https://data.alpaca.markets/v1beta3/crypto/us"
+
+# Alpaca timeframe grammar: an integer and a unit, e.g. 1Min, 15Min, 1Hour, 1Day.
+_TIMEFRAME = re.compile(r"^(\d+)(Min|T|Hour|H|Day|D|Week|W|Month|M)$")
+_UNIT_SECONDS = {
+    "Min": 60, "T": 60,
+    "Hour": 3600, "H": 3600,
+    "Day": 86400, "D": 86400,
+    "Week": 7 * 86400, "W": 7 * 86400,
+    "Month": 31 * 86400, "M": 31 * 86400,
+}
+BARS_MAX_PAGES = 10
+
+
+def timeframe_seconds(timeframe):
+    """Seconds spanned by one bar of an Alpaca timeframe string."""
+    m = _TIMEFRAME.match(str(timeframe))
+    if not m:
+        raise ValueError(f"unrecognised timeframe {timeframe!r}")
+    return int(m.group(1)) * _UNIT_SECONDS[m.group(2)]
 
 # Activity types that represent money entering or leaving the account, as
 # opposed to money made or lost trading. Time-weighted return needs these to
@@ -133,15 +154,28 @@ class Alpaca:
     # --- public market data -------------------------------------------------
 
     def fetch_bars(self, symbol, timeframe, limit):
-        """Recent OHLCV bars, ascending by time. Public endpoint."""
-        resp = requests.get(
-            f"{DATA_BASE}/bars",
-            params={"symbols": symbol, "timeframe": timeframe, "limit": limit},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        bars = resp.json().get("bars", {}).get(symbol, [])
-        return sorted(bars, key=lambda b: b["t"])
+        """The newest `limit` OHLCV bars, ascending by time. Public endpoint.
+
+        Without an explicit `start` Alpaca returns bars from midnight UTC of the
+        current day only - a few bars, and none at all just after midnight - so
+        the ATR would be undefined for most of every day. Ask for a window wide
+        enough to hold `limit` bars, newest first, and page until we have them:
+        the venue caps a page well below `limit` regardless of what is asked."""
+        span = timedelta(seconds=timeframe_seconds(timeframe) * limit * 1.5)
+        start = (datetime.now(timezone.utc) - span).strftime("%Y-%m-%dT%H:%M:%SZ")
+        params = {"symbols": symbol, "timeframe": timeframe, "limit": limit,
+                  "start": start, "sort": "desc"}
+        bars = []
+        for _ in range(BARS_MAX_PAGES):
+            resp = requests.get(f"{DATA_BASE}/bars", params=params, timeout=15)
+            resp.raise_for_status()
+            body = resp.json()
+            bars += body.get("bars", {}).get(symbol, [])
+            token = body.get("next_page_token")
+            if len(bars) >= limit or not token:
+                break
+            params["page_token"] = token
+        return sorted(bars[:limit], key=lambda b: b["t"])
 
     def latest_quote(self, symbol):
         """Best bid/ask and their midpoint. Public endpoint."""
