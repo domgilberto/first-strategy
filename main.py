@@ -2,11 +2,13 @@
 """
 Entry point. Orchestration only - the work lives in the modules:
 
-    strategy.py    the round-trip trader (intent + outcome, recorded to SQLite)
+    strategy.py    the averaging-ladder engine (opens, manages and closes cycles)
+    ladder.py      ladder geometry, risk-based sizing, take-profit decay (pure)
+    indicators.py  ATR (pure)
     snapshots.py   5-minute equity snapshots with incremental TWR and drawdown
     api.py         read-only bearer-token JSON API over the persisted state
-    state.py       SQLite on the persistent volume
-    alpaca.py      the one broker client, shared by everything above
+    state.py       SQLite on the persistent volume - every SQL statement
+    alpaca.py      the one broker client - every HTTP call
 
 Required TradingHost strategy secrets (environment variables):
     APCA_API_KEY_ID      Alpaca PAPER key id (starts with "PK")
@@ -32,7 +34,7 @@ from config import load_config
 from runtime import install_signal_handlers, log, running, sleep_interruptible
 from snapshots import Snapshotter
 from state import Store
-from strategy import Trader
+from strategy import MartingaleEngine
 
 DATA_DIR = os.environ.get("TRADINGHOST_DATA_DIR", "/data")
 PORTS = json.loads(os.environ.get("TRADINGHOST_PORTS", "[]"))
@@ -70,8 +72,8 @@ def main():
 
     if not key_id.startswith("PK"):
         log("error", "Refusing to start: APCA_API_KEY_ID does not look like a paper key",
-            hint="Paper keys begin with PK, live keys begin with AK. This strategy round-trips "
-                 "continuously and must never touch a live account.")
+            hint="Paper keys begin with PK, live keys begin with AK. This strategy averages "
+                 "down into positions and must never touch a live account.")
         return 1
 
     install_signal_handlers()
@@ -79,15 +81,15 @@ def main():
 
     api = Alpaca(key_id, secret_key)
     store = Store(DATA_DIR)
-    trader = Trader(api, store, config["symbol"], config["order_qty"], config["fill_timeout_seconds"])
+    engine = MartingaleEngine(api, store, config)
     snapshotter = Snapshotter(api, store, config["snapshot_seconds"])
 
     try:
         account = api.account()
         log("info", "Connected to Alpaca paper trading",
             account_number=account.get("account_number"), status=account.get("status"),
-            buying_power=account.get("buying_power"), currency=account.get("currency"))
-        trader.reconcile()
+            equity=account.get("equity"), buying_power=account.get("buying_power"))
+        engine.reconcile_on_start()
     except Exception as exc:
         log("error", "Could not reach Alpaca paper trading - refusing to start", error=str(exc),
             hint="A 401 means the key or secret is wrong, was regenerated (which invalidates the "
@@ -100,8 +102,7 @@ def main():
     # Both run on daemon threads and neither can take trading down with it.
 
     threading.Thread(target=snapshotter.run, name="snapshotter", daemon=True).start()
-    log("info", "Snapshotter started", interval_seconds=config["snapshot_seconds"],
-        store=store.counts())
+    log("info", "Snapshotter started", interval_seconds=config["snapshot_seconds"], store=store.counts())
 
     api_server = None
     port, port_source = resolve_api_port()
@@ -111,12 +112,11 @@ def main():
                  "does not appear here after a redeploy, set DASHBOARD_PORT=<targetPort> as a "
                  "strategy secret as a workaround.")
     elif not dashboard_token:
-        log("warn", "DASHBOARD_TOKEN not set - dashboard API disabled",
-            port=port, port_source=port_source,
+        log("warn", "DASHBOARD_TOKEN not set - dashboard API disabled", port=port, port_source=port_source,
             hint="Set DASHBOARD_TOKEN as a strategy secret and redeploy to enable it.")
     else:
         try:
-            api_server = Api(store, trader, snapshotter, dashboard_token, port, config["api_max_points"])
+            api_server = Api(store, engine, snapshotter, dashboard_token, port, config["api_max_points"])
             api_server.serve_forever_in_thread()
             public_ip = PORTS[0].get("publicIp") if PORTS else None
             log("info", "Dashboard API enabled", port=port, port_source=port_source,
@@ -126,33 +126,26 @@ def main():
 
     # --- trading loop -------------------------------------------------------
 
-    log("info", "Order-path smoke test running",
-        symbol=config["symbol"], order_qty=config["order_qty"],
-        cycle_seconds=config["cycle_seconds"],
-        note="Opens and closes one position per cycle. Paper only - loses to spread by design.")
+    log("info", "Averaging ladder running", symbol=config["symbol"], poll_seconds=config["poll_seconds"],
+        grid=config["grid"], risk=config["risk"], exit=config["exit"],
+        note="Long-only, volatility-scaled, sized to the worst case. Paper only.")
 
     while running():
         started = time.time()
-        try:
-            trader.round_trip()
-        except Exception as exc:
-            trader._fail()
-            log("error", "Cycle failed", error=str(exc))
-        sleep_interruptible(max(0.0, config["cycle_seconds"] - (time.time() - started)))
+        engine.step()
+        sleep_interruptible(max(0.0, float(config["poll_seconds"]) - (time.time() - started)))
 
     # --- shutdown -----------------------------------------------------------
+    # The open cycle, if any, is deliberately left in place: its orders rest at
+    # the broker and the plan is persisted, so a redeploy resumes it rather than
+    # forcing an exit at whatever price the market happens to be.
 
-    try:
-        trader.flatten(reason="shutdown")
-    except Exception as exc:
-        log("error", "Could not flatten on shutdown", error=str(exc))
     if api_server:
         api_server.shutdown()
-
-    summary = trader.status()
-    log("info", "Stopped cleanly", cycles=summary["cycles"], round_trips=summary["round_trips"],
-        failed_cycles=summary["failed_cycles"], cumulative_pnl=summary["cumulative_pnl"],
-        snapshots=snapshotter.status())
+    status = engine.status()
+    log("info", "Stopped cleanly",
+        open_cycle=status["cycle"]["id"] if status["cycle"] else None,
+        counters=status["counters"], snapshots=snapshotter.status())
     store.close()
     return 0
 

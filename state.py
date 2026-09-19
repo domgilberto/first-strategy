@@ -1,30 +1,38 @@
 """
 Persistent state, on the TradingHost persistent volume.
 
-Three tables, three different kinds of truth:
+Every SQL statement in the project lives in this module. The tables hold
+different kinds of truth:
 
-  round_trips       The bot's own record of what it *intended* and what came
-                    back - when it opened, when it closed, both order ids, both
-                    fill prices, the fee drag. The broker cannot produce this
-                    view; it sees two unrelated orders.
+  cycles / cycle_orders   The strategy's own record of intent and outcome: the
+                          ladder it planned, every order it placed, what filled
+                          at what price, and how the cycle ended. The broker
+                          cannot produce this view - it sees unrelated orders.
 
-  equity_snapshots  Immutable history. A past equity value never changes, so it
-                    is safe to persist - unlike positions or balances, which must
-                    always be asked of the broker. Each row also carries the
-                    running TWR chain and the all-time peak so that resuming after
-                    a restart is exact and needs no rescan.
+  round_trips             One row per completed cycle in the simple shape the
+                          dashboard's Trades panel reads: open/close time, both
+                          legs, realised P&L.
 
-  cash_flows        External money movements, ingested from Alpaca activities.
-                    Keyed on Alpaca's activity id so ingestion is idempotent.
+  markouts                Price some seconds/minutes after each of our fills,
+                          for calibrating spacing and take-profit against what
+                          the market actually does after we trade.
 
-Writes are serialised with a lock; the connection is shared across the trader,
+  equity_snapshots        Immutable history. A past equity value never changes,
+                          so it is safe to persist - unlike positions, which
+                          must always be asked of the broker. Each row carries
+                          the running TWR chain and all-time peak so resuming
+                          after a restart is exact.
+
+  cash_flows              External money movements from Alpaca activities,
+                          keyed on the activity id so ingestion is idempotent.
+
+Writes are serialised with a lock; the connection is shared across the engine,
 snapshotter and API threads. WAL mode lets the API read while a write is in
-flight.
-
-Schema changes are applied as idempotent migrations in `_migrate`, because the
-database lives on a persistent volume and outlives any one version of the code.
+flight. Schema changes are idempotent migrations in `_migrate`, because the
+database outlives any one version of the code.
 """
 
+import json
 import os
 import sqlite3
 import threading
@@ -41,6 +49,56 @@ CREATE TABLE IF NOT EXISTS round_trips (
     sell_price    REAL,
     pnl           REAL,
     opened_ts     TEXT             -- open time (entry fill), ISO-8601 UTC; NULL on legacy rows
+);
+
+CREATE TABLE IF NOT EXISTS cycles (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol           TEXT    NOT NULL,
+    opened_ts        INTEGER NOT NULL,          -- epoch ms
+    closed_ts        INTEGER,
+    status           TEXT    NOT NULL,          -- open | closed_tp | closed_stop | closed_timeout | closed_reconcile
+    plan_json        TEXT    NOT NULL,          -- ladder.CyclePlan.as_dict()
+    reference_price  REAL,
+    atr              REAL,
+    atr_pct          REAL,
+    stop_price       REAL,
+    tp_pct_initial   REAL,
+    filled_levels    INTEGER NOT NULL DEFAULT 0,
+    position_qty     REAL    NOT NULL DEFAULT 0,
+    avg_entry        REAL,
+    exit_price       REAL,
+    exit_qty         REAL,
+    pnl              REAL,                      -- estimated: buy fee via quantity, sell fee via est_fee_pct
+    reason           TEXT
+);
+CREATE INDEX IF NOT EXISTS cycles_status ON cycles (status);
+CREATE INDEX IF NOT EXISTS cycles_closed ON cycles (closed_ts);
+
+CREATE TABLE IF NOT EXISTS cycle_orders (
+    id               TEXT    PRIMARY KEY,       -- broker order id
+    cycle_id         INTEGER NOT NULL,
+    kind             TEXT    NOT NULL,          -- base | level | tp | exit
+    level_index      INTEGER,
+    side             TEXT    NOT NULL,
+    qty              REAL    NOT NULL,
+    limit_price      REAL,
+    status           TEXT    NOT NULL,          -- open | filled | canceled | expired | rejected
+    filled_qty       REAL,
+    filled_avg_price REAL,
+    submitted_ts     INTEGER NOT NULL,
+    filled_ts        INTEGER
+);
+CREATE INDEX IF NOT EXISTS cycle_orders_cycle ON cycle_orders (cycle_id);
+
+CREATE TABLE IF NOT EXISTS markouts (
+    order_id    TEXT    NOT NULL,
+    horizon_s   INTEGER NOT NULL,
+    side        TEXT    NOT NULL,
+    fill_price  REAL    NOT NULL,
+    mark_price  REAL    NOT NULL,
+    markout_bps REAL    NOT NULL,               -- positive = market moved in our favour after the fill
+    ts          INTEGER NOT NULL,
+    PRIMARY KEY (order_id, horizon_s)
 );
 
 CREATE TABLE IF NOT EXISTS equity_snapshots (
@@ -70,6 +128,8 @@ CREATE INDEX IF NOT EXISTS cash_flows_ts ON cash_flows (ts);
 MIGRATIONS = [
     ("round_trips", "opened_ts", "TEXT"),
 ]
+
+CYCLE_UPDATABLE = {"filled_levels", "position_qty", "avg_entry", "status"}
 
 
 def iso_utc(ms):
@@ -102,18 +162,138 @@ class Store:
             self.db.commit()
             self.db.close()
 
+    def _write(self, sql, params=()):
+        with self._lock:
+            cur = self.db.execute(sql, params)
+            self.db.commit()
+            return cur
+
+    # --- cycles -------------------------------------------------------------
+
+    def open_cycle(self, symbol, plan, opened_ms):
+        cur = self._write(
+            "INSERT INTO cycles (symbol, opened_ts, status, plan_json, reference_price, atr, "
+            "atr_pct, stop_price, tp_pct_initial) VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?)",
+            (symbol, opened_ms, json.dumps(plan.as_dict()), plan.reference_price, plan.atr,
+             plan.atr_pct, plan.stop_price, plan.tp_pct),
+        )
+        return cur.lastrowid
+
+    def get_open_cycle(self):
+        row = self.db.execute(
+            "SELECT * FROM cycles WHERE status = 'open' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_cycle(self, cycle_id, **fields):
+        bad = set(fields) - CYCLE_UPDATABLE
+        if bad:
+            raise ValueError(f"not updatable: {sorted(bad)}")
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self._write(f"UPDATE cycles SET {sets} WHERE id = ?", (*fields.values(), cycle_id))
+
+    def close_cycle(self, cycle_id, status, closed_ms, exit_price, exit_qty, pnl, reason,
+                    avg_entry, filled_levels):
+        self._write(
+            "UPDATE cycles SET status = ?, closed_ts = ?, exit_price = ?, exit_qty = ?, pnl = ?, "
+            "reason = ?, avg_entry = ?, filled_levels = ?, position_qty = 0 WHERE id = ?",
+            (status, closed_ms, exit_price, exit_qty, pnl, reason, avg_entry, filled_levels, cycle_id),
+        )
+
+    def recent_cycles(self, limit):
+        rows = self.db.execute("SELECT * FROM cycles ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def cycles_between(self, since_ms, until_ms, limit):
+        """Open cycles are always included; closed ones by close time."""
+        rows = self.db.execute(
+            "SELECT * FROM cycles WHERE status = 'open' OR (closed_ts >= ? AND closed_ts <= ?) "
+            "ORDER BY id DESC LIMIT ?",
+            (since_ms, until_ms, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- orders -------------------------------------------------------------
+
+    def add_order(self, o):
+        self._write(
+            "INSERT OR REPLACE INTO cycle_orders (id, cycle_id, kind, level_index, side, qty, "
+            "limit_price, status, filled_qty, filled_avg_price, submitted_ts, filled_ts) "
+            "VALUES (:id, :cycle_id, :kind, :level_index, :side, :qty, :limit_price, :status, "
+            ":filled_qty, :filled_avg_price, :submitted_ts, :filled_ts)",
+            {"level_index": None, "limit_price": None, "filled_qty": None,
+             "filled_avg_price": None, "filled_ts": None, **o},
+        )
+
+    def update_order(self, order_id, status, filled_qty=None, filled_avg_price=None, filled_ts=None):
+        self._write(
+            "UPDATE cycle_orders SET status = ?, "
+            "filled_qty = COALESCE(?, filled_qty), filled_avg_price = COALESCE(?, filled_avg_price), "
+            "filled_ts = COALESCE(?, filled_ts) WHERE id = ?",
+            (status, filled_qty, filled_avg_price, filled_ts, order_id),
+        )
+
+    def orders_for_cycle(self, cycle_id, kinds=None, statuses=None):
+        sql, params = "SELECT * FROM cycle_orders WHERE cycle_id = ?", [cycle_id]
+        if kinds:
+            sql += f" AND kind IN ({','.join('?' * len(kinds))})"
+            params += list(kinds)
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            params += list(statuses)
+        sql += " ORDER BY submitted_ts ASC, level_index ASC"
+        return [dict(r) for r in self.db.execute(sql, params).fetchall()]
+
+    # --- markouts -----------------------------------------------------------
+
+    def pending_markouts(self, horizons, now_ms, limit=50):
+        """Filled entry/exit orders whose horizon has elapsed and which have no
+        markout row yet for that horizon."""
+        out = []
+        for h in horizons:
+            rows = self.db.execute(
+                "SELECT o.id, o.side, o.filled_avg_price FROM cycle_orders o "
+                "WHERE o.status = 'filled' AND o.filled_ts IS NOT NULL AND o.filled_avg_price IS NOT NULL "
+                "AND o.filled_ts + ? <= ? "
+                "AND NOT EXISTS (SELECT 1 FROM markouts m WHERE m.order_id = o.id AND m.horizon_s = ?) "
+                "LIMIT ?",
+                (int(h) * 1000, now_ms, int(h), limit),
+            ).fetchall()
+            out += [(r["id"], int(h), r["side"], float(r["filled_avg_price"])) for r in rows]
+        return out
+
+    def add_markout(self, order_id, horizon_s, side, fill_price, mark_price, markout_bps, ts):
+        self._write(
+            "INSERT OR IGNORE INTO markouts (order_id, horizon_s, side, fill_price, mark_price, "
+            "markout_bps, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (order_id, horizon_s, side, fill_price, mark_price, markout_bps, ts),
+        )
+
+    def recent_markouts(self, limit):
+        rows = self.db.execute(
+            "SELECT * FROM markouts ORDER BY ts DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def markout_summary(self):
+        rows = self.db.execute(
+            "SELECT side, horizon_s, COUNT(*) AS n, AVG(markout_bps) AS avg_bps "
+            "FROM markouts GROUP BY side, horizon_s ORDER BY side, horizon_s"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- round trips --------------------------------------------------------
 
     def record_round_trip(self, symbol, qty, buy_id, buy_price, sell_id, sell_price, pnl,
                           opened_ms=None):
-        with self._lock:
-            self.db.execute(
-                "INSERT INTO round_trips (ts, symbol, qty, buy_order_id, buy_price, "
-                "sell_order_id, sell_price, pnl, opened_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (iso_utc(time.time() * 1000), symbol, qty, buy_id, buy_price, sell_id, sell_price,
-                 pnl, iso_utc(opened_ms) if opened_ms else None),
-            )
-            self.db.commit()
+        self._write(
+            "INSERT INTO round_trips (ts, symbol, qty, buy_order_id, buy_price, "
+            "sell_order_id, sell_price, pnl, opened_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (iso_utc(time.time() * 1000), symbol, qty, buy_id, buy_price, sell_id, sell_price,
+             pnl, iso_utc(opened_ms) if opened_ms else None),
+        )
 
     def recent_round_trips(self, limit):
         rows = self.db.execute(
@@ -147,15 +327,13 @@ class Store:
         snapshotter guarantees strictly increasing timestamps; if that ever
         fails, a loud IntegrityError is the correct outcome, not a quiet
         overwrite."""
-        with self._lock:
-            self.db.execute(
-                "INSERT INTO equity_snapshots (ts, equity, cash, buying_power, "
-                "long_market_value, flow, chain, twr, peak, drawdown) "
-                "VALUES (:ts, :equity, :cash, :buying_power, :long_market_value, "
-                ":flow, :chain, :twr, :peak, :drawdown)",
-                row,
-            )
-            self.db.commit()
+        self._write(
+            "INSERT INTO equity_snapshots (ts, equity, cash, buying_power, "
+            "long_market_value, flow, chain, twr, peak, drawdown) "
+            "VALUES (:ts, :equity, :cash, :buying_power, :long_market_value, "
+            ":flow, :chain, :twr, :peak, :drawdown)",
+            row,
+        )
 
     def snapshots_since(self, since_ms):
         rows = self.db.execute(
@@ -220,10 +398,17 @@ class Store:
         ).fetchone()
         trips = self.db.execute("SELECT COUNT(*) AS n FROM round_trips").fetchone()
         flows = self.db.execute("SELECT COUNT(*) AS n FROM cash_flows").fetchone()
+        cyc = self.db.execute(
+            "SELECT SUM(status = 'open') AS open, SUM(status != 'open') AS closed FROM cycles"
+        ).fetchone()
+        marks = self.db.execute("SELECT COUNT(*) AS n FROM markouts").fetchone()
         return {
             "snapshots": snaps["n"],
             "first_snapshot": snaps["first"],
             "last_snapshot": snaps["last"],
             "round_trips": trips["n"],
             "cash_flows": flows["n"],
+            "cycles_open": cyc["open"] or 0,
+            "cycles_closed": cyc["closed"] or 0,
+            "markouts": marks["n"],
         }

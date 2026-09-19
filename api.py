@@ -2,8 +2,8 @@
 Read-only JSON API over the container's persisted state.
 
 Served on the TradingHost-allocated port so a dashboard outside the container
-can read the equity history and the bot's own trade ledger. Design constraints,
-in order of importance:
+can read the equity history, the strategy's cycles and its trade ledger.
+Design constraints, in order of importance:
 
   * Read-only. Nothing here mutates state or places orders.
   * Bearer token on every data route, compared in constant time. The port is a
@@ -141,9 +141,9 @@ def summarise(points, interval_seconds, flow_count, all_time_dd):
 
 
 class Api:
-    def __init__(self, store, trader, snapshotter, token, port, max_points=2000):
+    def __init__(self, store, engine, snapshotter, token, port, max_points=2000):
         self.store = store
-        self.trader = trader
+        self.engine = engine
         self.snapshotter = snapshotter
         self.token = token
         self.port = port
@@ -174,6 +174,10 @@ class Api:
         _, flow_count = self.store.flows_between(since, until)
         return points, limit, flow_count, since, until
 
+    @staticmethod
+    def _limit(query, default, cap):
+        return min(int(query.get("limit", [default])[0]), cap)
+
     # --- handlers -----------------------------------------------------------
 
     def h_snapshots(self, query):
@@ -201,17 +205,37 @@ class Api:
         }
 
     def h_trades(self, query):
-        limit = min(int(query.get("limit", [200])[0]), 1000)
+        limit = self._limit(query, 200, 1000)
         if "since" in query or "until" in query:
             since, until = self._bounds(query)
             return {"since": since, "until": until,
                     "trades": self.store.round_trips_between(iso_utc(since), iso_utc(until), limit)}
         return {"trades": self.store.recent_round_trips(limit)}
 
+    def h_cycles(self, query):
+        """Cycles with their orders nested - the full intent-and-outcome record
+        the broker cannot produce."""
+        limit = self._limit(query, 50, 500)
+        if "since" in query or "until" in query:
+            since, until = self._bounds(query)
+            cycles = self.store.cycles_between(since, until, limit)
+        else:
+            cycles = self.store.recent_cycles(limit)
+        for c in cycles:
+            c["plan"] = json.loads(c.pop("plan_json"))
+            c["orders"] = self.store.orders_for_cycle(c["id"])
+        return {"cycles": cycles}
+
+    def h_markouts(self, query):
+        return {
+            "summary": self.store.markout_summary(),
+            "recent": self.store.recent_markouts(self._limit(query, 100, 1000)),
+        }
+
     def h_status(self, query):
         return {
             "uptimeSeconds": round(time.time() - self.started_at, 1),
-            "trader": self.trader.status(),
+            "engine": self.engine.status(),
             "snapshotter": self.snapshotter.status(),
             "store": self.store.counts(),
         }
@@ -225,6 +249,8 @@ class Api:
             "/api/summary": api.h_summary,
             "/api/performance": api.h_performance,
             "/api/trades": api.h_trades,
+            "/api/cycles": api.h_cycles,
+            "/api/markouts": api.h_markouts,
             "/api/status": api.h_status,
         }
 

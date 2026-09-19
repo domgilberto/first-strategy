@@ -1,8 +1,41 @@
 {
   "symbol": "BTC/USD",
-  "order_qty": 0.001,
-  "cycle_seconds": 60,
+  "poll_seconds": 20,
   "fill_timeout_seconds": 30,
   "snapshot_seconds": 300,
-  "api_max_points": 2000
+  "api_max_points": 2000,
+  "min_order_notional_usd": 10,
+  "qty_step": 0.000001,
+  "est_fee_pct": 0.0025,
+  "atr_period": 14,
+  "bars": {
+    "timeframe": "1Hour",
+    "lookback": 200,
+    "refresh_seconds": 300
+  },
+  "grid": {
+    "max_levels": 6,
+    "spacing_atr": 0.6,
+    "spacing_scale": 1.2,
+    "volume_scale": 1.5,
+    "stop_atr_below_last": 1.5
+  },
+  "risk": {
+    "max_cycle_loss_pct": 0.02,
+    "max_exposure_pct": 0.4,
+    "vol_gate_max_atr_pct": 0.03,
+    "vol_floor_atr_pct": 0.002,
+    "cooldown_minutes_after_stop": 120,
+    "cooldown_minutes_after_timeout": 30,
+    "cooldown_minutes_after_tp": 0
+  },
+  "exit": {
+    "tp_atr_mult": 1.0,
+    "cost_floor_pct": 0.008,
+    "breakeven_pct": 0.0055,
+    "decay_start_hours": 12,
+    "max_hold_hours": 36,
+    "tp_replace_threshold_pct": 0.0005
+  },
+  "markout_horizons_seconds": [300, 900, 3600]
 }
