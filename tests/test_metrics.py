@@ -16,6 +16,7 @@ These pin down the properties that make the numbers trustworthy:
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,6 +69,24 @@ class ChainTests(unittest.TestCase):
         # guarantees the next ts is strictly greater, so (prev, next] holds it.
         first_ts = store.last_snapshot()["ts"]
         store.upsert_cash_flows([{"id": "dep1", "ts": first_ts + 1, "type": "CSD", "amount": 50.0}])
+        snap.take()
+        last = store.last_snapshot()
+        self.assertAlmostEqual(last["twr"], 0.0, places=9)
+        self.assertEqual(last["flow"], 50.0)
+        store.close()
+
+    def test_date_only_deposit_is_applied_to_the_next_snapshot(self):
+        """Alpaca can date a deposit with the day alone. Read as midnight it
+        falls into an interval already snapshotted, and the equity jump it
+        caused would be booked as a return."""
+        store = make_store()
+        alp = FakeAlpaca([100.0, 150.0])
+        snap = Snapshotter(alp, store, 300)
+        snap.take()
+        first_ts = store.last_snapshot()["ts"]
+        day = time.strftime("%Y-%m-%d", time.gmtime(first_ts / 1000))
+        alp._flows = [{"id": "dep1", "activity_type": "CSD", "date": day, "net_amount": "50"}]
+        snap.ingest_cash_flows()
         snap.take()
         last = store.last_snapshot()
         self.assertAlmostEqual(last["twr"], 0.0, places=9)

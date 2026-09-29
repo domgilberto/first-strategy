@@ -8,9 +8,24 @@ set inside a 512 MB allocation. Only ever points at the paper endpoint.
 Market data (bars, latest quote) is public on Alpaca's crypto data API and
 needs no credentials; it is exposed as methods here anyway so the engine has
 one object to talk to and tests can substitute a fake broker wholesale.
+
+Failures come in two kinds, and callers need to tell them apart:
+
+  BrokerRefused      a definitive 4xx answer. Asking again will get the same
+                     answer, so it is raised at once.
+  BrokerUnavailable  a timeout, a dropped connection, a 429 or a 5xx. Worth
+                     another try, and retried here with a short backoff before
+                     it is raised. (Paper-api read timeouts happen in bursts;
+                     without a retry each one cost a whole poll.)
+
+An order submission is only safe to retry because every order carries a
+client_order_id: after an ambiguous failure the client first asks whether the
+order already landed, so a retry can never place it twice.
 """
 
 import re
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 
@@ -18,6 +33,23 @@ import requests
 
 TRADING_BASE = "https://paper-api.alpaca.markets"
 DATA_BASE = "https://data.alpaca.markets/v1beta3/crypto/us"
+
+RETRY_STATUS = {429, 500, 502, 503, 504}
+ATTEMPTS = 3
+BACKOFF_SECONDS = (0.5, 1.5)
+
+
+class BrokerRefused(RuntimeError):
+    """The broker answered and said no. Retrying will not change that."""
+
+    def __init__(self, method, path, status, text):
+        super().__init__(f"{method} {path} -> {status} {text}")
+        self.status = status
+        self.text = text
+
+
+class BrokerUnavailable(RuntimeError):
+    """No usable answer - timeout, dropped connection, rate limit or 5xx."""
 
 # Alpaca timeframe grammar: an integer and a unit, e.g. 1Min, 15Min, 1Hour, 1Day.
 _TIMEFRAME = re.compile(r"^(\d+)(Min|T|Hour|H|Day|D|Week|W|Month|M)$")
@@ -64,19 +96,97 @@ def fmt_price(price):
     return f"{round(float(price), PRICE_DP):.{PRICE_DP}f}"
 
 
+def new_client_order_id():
+    return f"mg-{uuid.uuid4().hex}"
+
+
+def _get_public(url, params, sleep=time.sleep):
+    """GET on the public market-data API, retrying what is worth retrying."""
+    for attempt in range(ATTEMPTS):
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            err = exc
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status not in RETRY_STATUS:
+                raise
+            err = exc
+        if attempt == ATTEMPTS - 1:
+            raise err
+        sleep(BACKOFF_SECONDS[attempt])
+
+
 class Alpaca:
-    def __init__(self, key_id, secret_key):
+    def __init__(self, key_id, secret_key, sleep=time.sleep):
         self.session = requests.Session()
         self.session.headers.update({
             "APCA-API-KEY-ID": key_id,
             "APCA-API-SECRET-KEY": secret_key,
         })
+        self._sleep = sleep
 
-    def _request(self, method, path, **kwargs):
-        resp = self.session.request(method, TRADING_BASE + path, timeout=15, **kwargs)
+    def _send(self, method, path, ok=(), **kwargs):
+        """One round trip. `ok` lists error statuses the caller treats as success."""
+        try:
+            resp = self.session.request(method, TRADING_BASE + path, timeout=15, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            raise BrokerUnavailable(f"{method} {path} -> {exc}") from exc
+        if resp.status_code in ok:
+            return {}
+        if resp.status_code in RETRY_STATUS:
+            raise BrokerUnavailable(f"{method} {path} -> {resp.status_code} {resp.text[:200]}")
         if resp.status_code >= 400:
-            raise RuntimeError(f"{method} {path} -> {resp.status_code} {resp.text[:200]}")
+            raise BrokerRefused(method, path, resp.status_code, resp.text[:200])
         return resp.json() if resp.text else {}
+
+    def _request(self, method, path, retry=True, **kwargs):
+        """Retry transient failures. Only for requests that are safe to repeat."""
+        for attempt in range(ATTEMPTS):
+            try:
+                return self._send(method, path, **kwargs)
+            except BrokerUnavailable:
+                if not retry or attempt == ATTEMPTS - 1:
+                    raise
+                self._sleep(BACKOFF_SECONDS[attempt])
+
+    def order_by_client_id(self, client_order_id):
+        """The order with this client_order_id, or None if there is none (or
+        the broker cannot say right now)."""
+        try:
+            return self._request("GET", "/v2/orders:by_client_order_id",
+                                 params={"client_order_id": client_order_id})
+        except (BrokerRefused, BrokerUnavailable):
+            return None
+
+    def _submit_order(self, body):
+        """POST an order so that a retry can never place it twice: after an
+        ambiguous failure, look the order up by its client_order_id before
+        sending it again."""
+        body = {**body, "client_order_id": new_client_order_id()}
+        ambiguous = False
+        for attempt in range(ATTEMPTS):
+            if ambiguous:
+                landed = self.order_by_client_id(body["client_order_id"])
+                if landed:
+                    return landed
+            try:
+                return self._send("POST", "/v2/orders", json=body)
+            except BrokerUnavailable:
+                ambiguous = True
+                if attempt == ATTEMPTS - 1:
+                    raise
+                self._sleep(BACKOFF_SECONDS[attempt])
+            except BrokerRefused:
+                # After an ambiguous attempt, a refusal may be the venue
+                # rejecting a duplicate client_order_id - i.e. it did land.
+                if ambiguous:
+                    landed = self.order_by_client_id(body["client_order_id"])
+                    if landed:
+                        return landed
+                raise
 
     # --- account & positions ------------------------------------------------
 
@@ -97,23 +207,23 @@ class Alpaca:
     def cancel_order(self, order_id):
         """Cancel one order. Alpaca answers 204 on success and 422 when the
         order is already in a terminal state - both are fine for a caller that
-        just wants it not to be resting any more."""
-        resp = self.session.delete(f"{TRADING_BASE}/v2/orders/{order_id}", timeout=15)
-        if resp.status_code not in (200, 204, 404, 422):
-            raise RuntimeError(f"DELETE /v2/orders/{order_id} -> {resp.status_code} {resp.text[:200]}")
+        just wants it not to be resting any more.
 
-    def cancel_all_orders(self):
-        self.session.delete(TRADING_BASE + "/v2/orders", timeout=15)
+        A 204 means the cancel was *accepted*, not that it happened: the order
+        can sit in pending_cancel, and fill, for a while yet. Callers confirm
+        with get_order before treating the order as gone."""
+        self._request("DELETE", f"/v2/orders/{order_id}", ok=(404, 422))
 
     def close_position(self, position_symbol):
         """Liquidate the whole position at market. Preferred over selling a
         computed quantity: Alpaca deducts its crypto fee from the filled
         quantity, so the position is always slightly smaller than the amount
-        ordered."""
-        return self._request("DELETE", f"/v2/positions/{position_symbol}")
+        ordered. Not retried - it is not idempotent, and the engine re-attempts
+        the exit on its next poll anyway."""
+        return self._request("DELETE", f"/v2/positions/{position_symbol}", retry=False)
 
     def submit_market_order(self, symbol, qty, side):
-        return self._request("POST", "/v2/orders", json={
+        return self._submit_order({
             "symbol": symbol,
             "qty": fmt_qty(qty),
             "side": side,
@@ -125,7 +235,7 @@ class Alpaca:
         """A resting limit order. The ladder's safety levels and the take-profit
         are all limits: they wait at the price rather than chasing it, and a
         resting fill is charged the lower maker fee."""
-        return self._request("POST", "/v2/orders", json={
+        return self._submit_order({
             "symbol": symbol,
             "qty": fmt_qty(qty),
             "side": side,
@@ -167,9 +277,7 @@ class Alpaca:
                   "start": start, "sort": "desc"}
         bars = []
         for _ in range(BARS_MAX_PAGES):
-            resp = requests.get(f"{DATA_BASE}/bars", params=params, timeout=15)
-            resp.raise_for_status()
-            body = resp.json()
+            body = _get_public(f"{DATA_BASE}/bars", params, self._sleep)
             bars += body.get("bars", {}).get(symbol, [])
             token = body.get("next_page_token")
             if len(bars) >= limit or not token:
@@ -179,11 +287,8 @@ class Alpaca:
 
     def latest_quote(self, symbol):
         """Best bid/ask and their midpoint. Public endpoint."""
-        resp = requests.get(
-            f"{DATA_BASE}/latest/quotes", params={"symbols": symbol}, timeout=15
-        )
-        resp.raise_for_status()
-        q = resp.json().get("quotes", {}).get(symbol)
+        body = _get_public(f"{DATA_BASE}/latest/quotes", {"symbols": symbol}, self._sleep)
+        q = body.get("quotes", {}).get(symbol)
         if not q:
             return None
         ask, bid = float(q.get("ap") or 0), float(q.get("bp") or 0)

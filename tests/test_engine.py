@@ -21,6 +21,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from alpaca import BrokerRefused, BrokerUnavailable  # noqa: E402
 from state import Store  # noqa: E402
 from strategy import MartingaleEngine  # noqa: E402
 
@@ -28,6 +29,7 @@ CONFIG = {
     "symbol": "BTC/USD",
     "poll_seconds": 20,
     "fill_timeout_seconds": 1,
+    "cancel_timeout_seconds": 1,
     "snapshot_seconds": 300,
     "api_max_points": 2000,
     "min_order_notional_usd": 10,
@@ -60,14 +62,21 @@ class FakeClock:
         self.t += seconds
 
 
+LIVE = ("new", "pending_cancel")
+
+
 class FakeBroker:
-    def __init__(self, price, atr_range=450.0, cash=100_000.0):
+    """slow_cancels=True models Alpaca accepting a cancel but leaving the order
+    in pending_cancel - still able to fill - until the market next moves."""
+
+    def __init__(self, price, atr_range=450.0, cash=100_000.0, slow_cancels=False):
         self.price = price
         self.atr_range = atr_range
         self.cash = cash
         self.qty = 0.0
         self.orders = {}
         self._seq = 0
+        self.slow_cancels = slow_cancels
 
     # -- market data --
     def fetch_bars(self, symbol, timeframe, limit):
@@ -108,7 +117,7 @@ class FakeBroker:
         o["status"], o["filled_qty"], o["filled_avg_price"] = "filled", str(q), str(px)
 
     def _try_fill(self, o):
-        if o["status"] != "new" or o["type"] != "limit":
+        if o["status"] not in LIVE or o["type"] != "limit" or o["symbol"] != "BTC/USD":
             return
         lp = float(o["limit_price"])
         if o["side"] == "buy" and self.price <= lp:
@@ -120,6 +129,9 @@ class FakeBroker:
         self.price = price
         for o in list(self.orders.values()):
             self._try_fill(o)
+        for o in self.orders.values():      # then any pending cancel lands
+            if o["status"] == "pending_cancel":
+                o["status"] = "canceled"
 
     def submit_market_order(self, symbol, qty, side):
         o = self._new(symbol, qty, side, "market", None)
@@ -132,19 +144,14 @@ class FakeBroker:
         return dict(o)
 
     def open_orders(self):
-        return [dict(o) for o in self.orders.values() if o["status"] == "new"]
+        return [dict(o) for o in self.orders.values() if o["status"] in LIVE]
 
     def get_order(self, oid):
         return dict(self.orders[oid])
 
     def cancel_order(self, oid):
         if self.orders[oid]["status"] == "new":
-            self.orders[oid]["status"] = "canceled"
-
-    def cancel_all_orders(self):
-        for o in self.orders.values():
-            if o["status"] == "new":
-                o["status"] = "canceled"
+            self.orders[oid]["status"] = "pending_cancel" if self.slow_cancels else "canceled"
 
     def close_position(self, symbol):
         o = self._new(symbol, self.qty, "sell", "market", None)
@@ -417,7 +424,7 @@ class SoftwareTakeProfitTests(EngineCase):
         class NoRestingSells(FakeBroker):
             def submit_limit_order(self, symbol, qty, side, limit_price):
                 if side == "sell":
-                    raise RuntimeError("POST /v2/orders -> 403 potential wash trade detected")
+                    raise BrokerRefused("POST", "/v2/orders", 403, "potential wash trade detected")
                 return super().submit_limit_order(symbol, qty, side, limit_price)
 
         broker = NoRestingSells(81_000.0)
@@ -455,6 +462,153 @@ class SoftwareTakeProfitTests(EngineCase):
         self.assertEqual(c["status"], "closed_tp")
         self.assertGreater(c["pnl"], 0)
         self.assertClean(eng)   # a handled fallback is not an engine error
+
+    def test_a_transient_failure_placing_the_take_profit_is_retried_not_downgraded(self):
+        class FlakyFirstSell(FakeBroker):
+            failed = False
+
+            def submit_limit_order(self, symbol, qty, side, limit_price):
+                if side == "sell" and not self.failed:
+                    self.failed = True
+                    raise BrokerUnavailable("POST /v2/orders -> 503 service unavailable")
+                return super().submit_limit_order(symbol, qty, side, limit_price)
+
+        broker = FlakyFirstSell(81_000.0)
+        eng, _, _ = make_engine(broker)
+        eng.reconcile_on_start()
+        eng.step()
+        self.assertIsNotNone(eng.cycle)
+        self.assertIsNone(eng.tp_order_id)
+        eng.step()
+        self.assertEqual(eng.tp_mode, "limit")
+        self.assertIsNotNone(eng.tp_order_id)
+        self.assertEqual(sum(1 for o in broker.open_orders() if o["side"] == "sell"), 1)
+        self.assertEqual(eng.status()["counters"]["errors"], 1)   # counted, not hidden
+
+
+class FailureRecoveryTests(EngineCase):
+    def test_a_failure_while_placing_the_ladder_is_repaired_not_doubled(self):
+        """Regression: a timeout on the third safety level used to leave the
+        cycle unrecorded in memory, so the next poll bought a second base and
+        orphaned the first ladder."""
+
+        class FlakyThirdLevel(FakeBroker):
+            buys = 0
+
+            def submit_limit_order(self, symbol, qty, side, limit_price):
+                if side == "buy":
+                    self.buys += 1
+                    if self.buys == 3:
+                        raise BrokerUnavailable("POST /v2/orders -> read timed out")
+                return super().submit_limit_order(symbol, qty, side, limit_price)
+
+        broker = FlakyThirdLevel(81_000.0)
+        eng, store, _ = make_engine(broker)
+        eng.reconcile_on_start()
+        eng.step()
+        self.assertIsNotNone(eng.cycle)
+        eng.step()
+
+        self.assertEqual(store.counts()["cycles_open"], 1)
+        orders = store.orders_for_cycle(eng.cycle["id"])
+        self.assertEqual(sum(1 for o in orders if o["kind"] == "base"), 1)
+        self.assertEqual(sorted(o["level_index"] for o in orders if o["kind"] == "level"), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(sum(1 for o in broker.open_orders() if o["side"] == "buy"), 6)
+        self.assertEqual(sum(1 for o in broker.open_orders() if o["side"] == "sell"), 1)
+        self.assertAlmostEqual(broker.qty, eng.plan.levels[0].qty * (1 - FEE), places=9)
+        self.assertEqual(eng.status()["counters"]["errors"], 1)
+
+    def test_strays_are_flattened_before_the_next_cycle_and_other_symbols_left_alone(self):
+        broker = FakeBroker(81_000.0)
+        other = broker.submit_limit_order("ETH/USD", 1.0, "buy", 1.0)   # another strategy's order
+        eng, _, _ = make_engine(broker)
+        eng.reconcile_on_start()
+        self.assertEqual(broker.get_order(other["id"])["status"], "new")
+
+        stray = broker.submit_limit_order("BTC/USD", 0.001, "buy", 70_000.0)   # a cancel that never landed
+        broker.qty = 0.005                                                   # and a fill nobody booked
+        eng.step()
+        self.assertIsNone(eng.cycle)                      # cleaned up instead of opening on top
+        self.assertLess(broker.qty, 1e-9)
+        self.assertEqual(broker.get_order(stray["id"])["status"], "canceled")
+        self.assertEqual(broker.get_order(other["id"])["status"], "new")
+
+        eng.step()
+        self.assertIsNotNone(eng.cycle)
+        self.assertEqual(broker.get_order(other["id"])["status"], "new")
+        self.assertClean(eng)
+
+    def test_cooldown_survives_a_restart(self):
+        broker = FakeBroker(81_000.0)
+        eng, store, clock = make_engine(broker)
+        eng.reconcile_on_start()
+        eng.step()
+        broker.tick(eng.plan.stop_price - 1)
+        eng.step()
+        self.assertEqual(store.recent_cycles(1)[0]["status"], "closed_stop")
+
+        clock.advance(10 * 60)
+        eng2 = MartingaleEngine(broker, store, CONFIG, clock=clock)   # e.g. a push to main
+        eng2.reconcile_on_start()
+        eng2.step()
+        self.assertIsNone(eng2.cycle)
+        self.assertIsNotNone(eng2.status()["cooldown_until"])
+        clock.advance(111 * 60)
+        eng2.step()
+        self.assertIsNotNone(eng2.cycle)
+        self.assertClean(eng2)
+
+
+class SlowCancelTests(EngineCase):
+    def test_take_profit_is_not_replaced_until_its_cancel_is_confirmed(self):
+        broker = FakeBroker(81_000.0, slow_cancels=True)
+        eng, store, _ = make_engine(broker)
+        eng.reconcile_on_start()
+        eng.step()
+        old_tp = eng.tp_order_id
+
+        broker.tick(eng.plan.levels[1].price - 1)   # level 1 fills: the TP must be re-sized
+        eng.step()
+        sells = [o["id"] for o in broker.open_orders() if o["side"] == "sell"]
+        self.assertEqual(sells, [old_tp])            # no second sell for the same BTC
+        self.assertEqual(eng.tp_order_id, old_tp)
+        self.assertEqual(eng.tp_mode, "limit")        # not mistaken for a venue refusal
+        tp_row = next(o for o in store.orders_for_cycle(eng.cycle["id"]) if o["id"] == old_tp)
+        self.assertEqual(tp_row["status"], "open")   # not booked as cancelled on hope
+
+        broker.tick(broker.price)                   # the cancel lands
+        eng.step()
+        sells = [o for o in broker.open_orders() if o["side"] == "sell"]
+        self.assertEqual(len(sells), 1)
+        self.assertNotEqual(sells[0]["id"], old_tp)
+        self.assertAlmostEqual(float(sells[0]["qty"]), broker.qty, places=6)
+        self.assertClean(eng)
+
+    def test_take_profit_that_fills_while_its_cancel_is_pending_is_booked(self):
+        broker = FakeBroker(81_000.0, slow_cancels=True)
+        eng, store, _ = make_engine(broker)
+        eng.reconcile_on_start()
+        eng.step()
+        old_tp = eng.tp_order_id
+        tp_price = float(broker.get_order(old_tp)["limit_price"])
+
+        broker.tick(eng.plan.levels[1].price - 1)
+        eng.step()                                  # cancel requested, still pending
+        broker.tick(tp_price + 10)                  # ...and the old TP fills first
+        eng.step()
+
+        self.assertIsNone(eng.cycle)
+        self.assertLess(broker.qty, 1e-9)
+        c = store.recent_cycles(1)[0]
+        self.assertEqual(c["status"], "closed_tp")
+        tp_row = next(o for o in store.orders_for_cycle(c["id"]) if o["id"] == old_tp)
+        self.assertEqual(tp_row["status"], "filled")
+        self.assertGreater(c["pnl"], 0)
+
+        broker.tick(broker.price)                   # the remaining level cancels land
+        eng.step()                                  # next cycle settles the old rows first
+        self.assertEqual([o for o in store.orders_for_cycle(c["id"]) if o["status"] == "open"], [])
+        self.assertClean(eng)
 
 
 class BrokerWireTests(unittest.TestCase):
@@ -532,6 +686,68 @@ class BrokerWireTests(unittest.TestCase):
         self.assertEqual(bars[0]["t"], "2026-09-19T05:00:00Z")
 
 
+class RetryTests(unittest.TestCase):
+    """The broker client retries what is safe to retry, and never places an
+    order twice."""
+
+    class Resp:
+        def __init__(self, status, body=""):
+            self.status_code, self.text = status, body
+
+        def json(self):
+            import json
+            return json.loads(self.text)
+
+    def _client(self, handler):
+        import alpaca
+        client = alpaca.Alpaca("PKtest", "secret", sleep=lambda s: None)
+        calls = []
+
+        def request(method, url, timeout=None, **kw):
+            calls.append((method, url, kw))
+            return handler(method, url, kw, calls)
+
+        client.session.request = request
+        return client, calls
+
+    def test_reads_retry_a_transient_failure(self):
+        replies = [self.Resp(503, "busy"), self.Resp(200, '{"equity": "100"}')]
+        client, calls = self._client(lambda *a: replies.pop(0))
+        self.assertEqual(client.account()["equity"], "100")
+        self.assertEqual(len(calls), 2)
+
+    def test_a_definitive_refusal_is_not_retried(self):
+        client, calls = self._client(lambda *a: self.Resp(403, "potential wash trade detected"))
+        with self.assertRaises(BrokerRefused) as ctx:
+            client.submit_limit_order("BTC/USD", 0.01, "sell", 90_000)
+        self.assertEqual(ctx.exception.status, 403)
+        self.assertEqual(len(calls), 1)
+
+    def test_an_order_whose_reply_was_lost_is_found_not_resent(self):
+        import requests
+
+        def handler(method, url, kw, calls):
+            if method == "POST":
+                raise requests.ConnectionError("connection reset")   # it landed; the reply did not
+            if "by_client_order_id" in url:
+                return self.Resp(200, '{"id": "o1", "status": "new", "client_order_id": "%s"}'
+                                 % kw["params"]["client_order_id"])
+            raise AssertionError(url)
+
+        client, calls = self._client(handler)
+        order = client.submit_limit_order("BTC/USD", 0.01, "buy", 80_000)
+        self.assertEqual(order["id"], "o1")
+        posts = [c for c in calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(order["client_order_id"], posts[0][2]["json"]["client_order_id"])
+
+    def test_close_position_is_not_retried(self):
+        client, calls = self._client(lambda *a: self.Resp(503, "busy"))
+        with self.assertRaises(BrokerUnavailable):
+            client.close_position("BTCUSD")
+        self.assertEqual(len(calls), 1)
+
+
 class MarkoutTests(EngineCase):
     def test_markouts_recorded_after_horizon_at_a_fresh_price(self):
         broker = FakeBroker(81_000.0)
@@ -546,6 +762,16 @@ class MarkoutTests(EngineCase):
         self.assertEqual(len(marks), 1)
         self.assertEqual(marks[0]["horizon_s"], 300)
         self.assertAlmostEqual(marks[0]["markout_bps"], 100.0, places=3)   # +1% after our buy
+        self.assertClean(eng)
+
+    def test_markouts_that_came_due_during_downtime_are_skipped_not_mislabelled(self):
+        broker = FakeBroker(81_000.0)
+        eng, store, clock = make_engine(broker)
+        eng.reconcile_on_start()
+        eng.step()
+        clock.advance(2 * 3600)
+        eng.step()
+        self.assertEqual(store.recent_markouts(10), [])
         self.assertClean(eng)
 
 

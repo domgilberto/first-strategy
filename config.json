@@ -2,6 +2,7 @@
   "symbol": "BTC/USD",
   "poll_seconds": 20,
   "fill_timeout_seconds": 30,
+  "cancel_timeout_seconds": 10,
   "snapshot_seconds": 300,
   "api_max_points": 2000,
   "min_order_notional_usd": 10,

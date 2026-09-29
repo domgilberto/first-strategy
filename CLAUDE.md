@@ -16,8 +16,8 @@ Canonical platform conventions live in the template repo this project follows:
   strategy secrets: `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `DASHBOARD_TOKEN`, plus the
   `DASHBOARD_PORT` workaround (see `resolve_api_port` in `main.py` — the platform list
   `TRADINGHOST_PORTS` takes precedence whenever it is populated).
-- **Never put secrets in `config.json` / `config.example.json`** — those are committed
-  to git and are for non-secret tunables only.
+- **Never put secrets in `config.json`** — it is committed to git and is for non-secret
+  tunables only. The committed file is what runs; there is no copy on the volume.
 - **Never write state outside `TRADINGHOST_DATA_DIR`** — everything else is ephemeral.
 - **The API is read-only.** No route may mutate state or place orders. Every data route
   checks the bearer token with `hmac.compare_digest`.
@@ -57,6 +57,20 @@ to *when* the engine acts belongs in `strategy.py`, a new table belongs in `stat
   its `status` and `reason`. Every close also writes a `round_trips` row with `opened_ts`.
 - **The stop is software-enforced per poll.** Do not lengthen `poll_seconds` without
   understanding that it widens the gap the stop can miss.
+- **Nothing trades outside a cycle.** Before opening, the symbol must be flat (dust aside)
+  with nothing resting; anything left over is cancelled and sold first. Only this
+  strategy's symbol is ever touched — the account may be shared.
+- **The cycle is on record the moment the base fills.** Everything after that (levels,
+  take-profit) is placed by a step that `_manage` repeats, so a failed call is finished
+  on the next poll, never answered by opening a second cycle.
+- **A cancel is a request, not a fact.** An order is recorded as gone only when the
+  broker reports a terminal state. Never place a replacement take-profit while the old
+  one is still live.
+- **Only a definitive refusal (`BrokerRefused`) switches the take-profit to software.**
+  A timeout or outage (`BrokerUnavailable`) is retried on the next poll.
+- **Cooldowns survive restarts** — they are derived from the last close on record.
+- **Orders carry a `client_order_id`.** That is what makes retrying a submission safe;
+  `close_position` is not idempotent and is not retried.
 - `tests/test_engine.py` (simulated broker) and `tests/test_ladder.py` pin all of this.
   Run both before pushing a change to `strategy.py` or `ladder.py`.
 
@@ -86,7 +100,8 @@ to *when* the engine acts belongs in `strategy.py`, a new table belongs in `stat
   `DASHBOARD_PORT` while the platform leaves the list empty. The public address is
   `publicIp:nodePort`, plain HTTP.
 - A push to the tracked branch (`main`) redeploys automatically. Feature branches are
-  invisible to the platform until merged.
+  invisible to the platform until merged. Work on a branch, open a pull request, and
+  merge only when the `tests` workflow (all of `tests/`) is green.
 - Changing a secret needs a **redeploy**, not a restart.
 
 ## Dependencies

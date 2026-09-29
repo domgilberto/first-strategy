@@ -106,10 +106,11 @@ Never put them in `config.json`.
 
 ## Tunables
 
-`config.example.json` is committed and seeded once to
-`{TRADINGHOST_DATA_DIR}/config.json`. The loader deep-merges the persisted copy
-over the committed defaults and logs any keys that are missing or no longer
-used, so an older config never crashes a newer version.
+`config.json` is committed, and what is committed is what runs: change a value,
+merge, and the redeploy picks it up. (Earlier versions seeded a copy onto the
+volume that then overrode the repo forever — the bot ran a 60 s poll left over
+from the SMA version. A copy found there now is logged with its differences and
+renamed to `config.json.retired`.)
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -185,7 +186,9 @@ the broker and its plan is persisted. On start the engine applies anything that
 filled while it was away — a take-profit that hit during the outage closes the
 cycle properly, with P&L — then compares the broker position with its recorded
 fills. If they agree, it resumes; if they do not, it closes the cycle, flattens,
-and starts clean. A position with no cycle on record is flattened.
+and starts clean. A position with no cycle on record is flattened, resting
+orders the open cycle does not know are cancelled, and a cooldown that was
+running before the restart carries on.
 
 ## Deploying
 
@@ -212,3 +215,14 @@ the cooldown; the target decays with age; max-hold exits at market; a restart
 adopts the live take-profit rather than replacing it; a take-profit that filled
 during downtime closes the cycle properly; a hand-altered position is detected
 and flattened; mark-outs are recorded after their horizon.
+
+They also cover the failure paths: a timeout part-way through placing the
+ladder is repaired on the next poll rather than opening a second cycle; a
+take-profit whose cancel is still pending is neither replaced nor forgotten,
+and is booked if it fills; strays are flattened before a new cycle while other
+symbols are left alone; a cooldown survives a restart; transient broker errors
+are retried and a lost order reply is found by `client_order_id`, not resent.
+
+`python -m unittest discover -s tests -v` runs everything, and the `tests`
+GitHub workflow runs it on every push and pull request. Pushing to `main`
+deploys, so merge through a pull request once it is green.

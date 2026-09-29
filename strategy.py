@@ -50,6 +50,7 @@ import json
 import threading
 import time
 
+from alpaca import BrokerRefused
 from indicators import atr as compute_atr
 from ladder import average_entry, plan_cycle, plan_from_dict, tp_pct_for_age
 from runtime import log
@@ -101,6 +102,7 @@ class MartingaleEngine:
         self.exit = config["exit"]
         self.bars_cfg = config["bars"]
         self.fee = float(config.get("est_fee_pct", 0.0025))
+        self.cancel_timeout = float(config.get("cancel_timeout_seconds", 10))
         self.clock = clock or time.time
 
         self.cycle = None            # open cycle row from the store
@@ -110,6 +112,7 @@ class MartingaleEngine:
         self.tp_pct_current = None
         self.tp_mode = "limit"       # "limit" = resting sell at the venue; "software" = checked each poll
         self.cooldown_until_ms = 0
+        self._refused_levels = set()  # level indices the venue refused this cycle - not retried
 
         self._bars = None
         self._bars_at = 0
@@ -165,6 +168,82 @@ class MartingaleEngine:
         pos = find_position(self.api, self.symbol)
         return (_f(pos.get("qty")) if pos else 0.0), pos
 
+    def _held_qty(self):
+        """Broker position for this symbol, with dust counted as flat."""
+        qty, pos = self._position_qty()
+        if qty > 0 and self.last_price and qty * self.last_price < DUST_NOTIONAL_USD:
+            return 0.0, pos
+        return qty, pos
+
+    def _symbol_open_orders(self):
+        """Resting orders for this strategy's symbol only. The account may be
+        shared; another strategy's orders are never ours to cancel."""
+        wanted = self.symbol.replace("/", "")
+        return [o for o in self.api.open_orders() if o.get("symbol", "").replace("/", "") == wanted]
+
+    def _cooldown_minutes(self, status):
+        return float({
+            "closed_stop": self.risk.get("cooldown_minutes_after_stop", 120),
+            "closed_timeout": self.risk.get("cooldown_minutes_after_timeout", 30),
+            "closed_tp": self.risk.get("cooldown_minutes_after_tp", 0),
+            "closed_reconcile": self.risk.get("cooldown_minutes_after_timeout", 30),
+        }.get(status, 0))
+
+    def _restore_cooldown(self):
+        """A cooldown is derived from the last close on record, so a restart -
+        and every push to main is one - cannot cut it short."""
+        last = self.store.last_closed_cycle()
+        if not last:
+            return
+        until = int(last["closed_ts"]) + int(self._cooldown_minutes(last["status"]) * 60_000)
+        if until > self.now_ms():
+            self.cooldown_until_ms = until
+            log("info", "Cooldown carried over from before the restart", cycle_id=last["id"],
+                status=last["status"], minutes_left=round((until - self.now_ms()) / 60_000, 1))
+
+    # --- cancels ----------------------------------------------------------------
+    #
+    # A cancel is a request, not a fact. Alpaca accepts it with a 204 and the
+    # order can sit in pending_cancel - and fill - for a while after. So an
+    # order is only recorded as gone once the broker reports a terminal state.
+
+    def _request_cancel(self, order_id):
+        try:
+            self.api.cancel_order(order_id)
+        except Exception as exc:
+            log("warn", "Cancel request failed", order_id=order_id, error=str(exc))
+
+    def _await_orders(self, order_ids):
+        """Poll each order until it is terminal, sharing one deadline. Returns
+        {id: last order seen}."""
+        deadline = time.time() + self.cancel_timeout
+        finals = {}
+        for oid in order_ids:
+            order = self.api.get_order(oid)
+            while order.get("status") not in TERMINAL and time.time() < deadline:
+                time.sleep(1)
+                order = self.api.get_order(oid)
+            finals[oid] = order
+        return finals
+
+    def _record_final(self, order_id, final):
+        fq, fp = _f(final.get("filled_qty")), _f(final.get("filled_avg_price"))
+        self.store.update_order(order_id, final["status"], fq or None, fp or None,
+                                self.now_ms() if fq > 0 else None)
+        return fq, fp
+
+    def _settle_stale_orders(self):
+        """Close out rows a previous cycle left open because its cancels had not
+        been confirmed when it ended."""
+        for o in self.store.stale_open_orders():
+            final = self.api.get_order(o["id"])
+            if final.get("status") not in TERMINAL:
+                continue  # still live: the flat check below treats it as a stray
+            fq, _ = self._record_final(o["id"], final)
+            if fq > 0 and o["kind"] in ENTRY_KINDS:
+                log("warn", "An order of a closed cycle filled after the close - flattening it",
+                    order_id=o["id"], cycle_id=o["cycle_id"], qty=fq)
+
     def _expected_position(self):
         return sum(q for q, _ in self.fills) * (1.0 - self.fee)
 
@@ -179,11 +258,17 @@ class MartingaleEngine:
 
     def reconcile_on_start(self):
         """Never trust local state after a restart - ask the broker, then decide."""
+        self._restore_cooldown()
+        try:
+            self.price()  # so dust can be told apart from a position
+        except Exception as exc:
+            log("warn", "No price at startup - dust cannot be told from a position", error=str(exc))
         open_cycle = self.store.get_open_cycle()
-        pos_qty, _ = self._position_qty()
-        broker_open = self.api.open_orders()
+        broker_open = self._symbol_open_orders()
 
         if open_cycle is None:
+            self._settle_stale_orders()
+            pos_qty, _ = self._held_qty()
             if pos_qty > 0 or broker_open:
                 log("warn", "Position or resting orders found with no open cycle - flattening",
                     position_qty=pos_qty, open_orders=len(broker_open))
@@ -205,6 +290,20 @@ class MartingaleEngine:
         if self.tp_order_id and self.fills:
             avg = average_entry(self.fills)
             self.tp_pct_current = _f(tp_rows[-1]["limit_price"]) / avg - 1.0 if avg else None
+
+        # A resting order for this symbol that the cycle has no record of - one
+        # submitted just before a crash, or left by an earlier cycle - is not
+        # part of the plan and must not fill into it.
+        known = {o["id"] for o in self.store.orders_for_cycle(open_cycle["id"])}
+        strays = [o["id"] for o in broker_open if o["id"] not in known]
+        if strays:
+            log("warn", "Cancelling resting orders the open cycle has no record of",
+                cycle_id=open_cycle["id"], order_ids=strays)
+            for oid in strays:
+                self._request_cancel(oid)
+            for oid, final in self._await_orders(strays).items():
+                if final.get("status") in TERMINAL:
+                    self._record_final(oid, final)
 
         # Anything that filled while we were away is applied first - a
         # take-profit that hit during the outage closes the cycle properly.
@@ -254,6 +353,19 @@ class MartingaleEngine:
         if price is None or atr_eff is None:
             log("warn", "No price or ATR available yet - not opening")
             return
+
+        # Nothing trades outside a cycle. If anything for this symbol is still
+        # at the broker - a cancel that never landed, a base order that filled
+        # after it was given up on - clean it up instead of building on top.
+        self._settle_stale_orders()
+        held, _ = self._held_qty()
+        strays = self._symbol_open_orders()
+        if held > 0 or strays:
+            log("warn", "Position or resting orders found with no open cycle - flattening before the next cycle",
+                position_qty=held, open_orders=len(strays))
+            self._flatten_everything()
+            return
+
         if atr_pct > float(self.risk["vol_gate_max_atr_pct"]):
             self._count("skipped_vol_gate")
             log("info", "Volatility gate closed - not opening a cycle",
@@ -290,25 +402,46 @@ class MartingaleEngine:
         })
         self.fills = [(fq, fp)]
         self.tp_mode = "limit"
-
-        for lvl in plan.levels[1:]:
-            o = self.api.submit_limit_order(self.symbol, lvl.qty, "buy", lvl.price)
-            self.store.add_order({
-                "id": o["id"], "cycle_id": cycle_id, "kind": "level", "level_index": lvl.index,
-                "side": "buy", "qty": lvl.qty, "limit_price": lvl.price, "status": "open",
-                "submitted_ts": now,
-            })
-
+        self._refused_levels = set()
         self.plan = plan
         self.store.update_cycle(cycle_id, filled_levels=1, avg_entry=fp, position_qty=fq * (1.0 - self.fee))
         self._refresh_cycle()
-        self._place_tp(plan.tp_pct)
         self._count("cycles_opened")
         log("info", "Cycle opened", cycle_id=cycle_id, reference_price=price, atr=round(atr_eff, 2),
             atr_pct=round(atr_pct, 5), base_qty=base.qty, base_fill=fp, safety_levels=len(plan.levels) - 1,
             lowest_level=round(plan.levels[-1].price, 2), stop_price=round(plan.stop_price, 2),
-            tp_pct=round(plan.tp_pct, 5), tp_mode=self.tp_mode, total_notional=round(plan.total_notional, 2),
+            tp_pct=round(plan.tp_pct, 5), total_notional=round(plan.total_notional, 2),
             worst_case_loss=round(plan.worst_case_loss, 2), binding=plan.binding)
+
+        # The cycle is on record from here on. If a call below fails, the next
+        # poll manages this cycle - placing whatever is missing - instead of
+        # opening a second one on top and orphaning these orders.
+        self._place_missing_levels(price)
+        self._place_tp(plan.tp_pct)
+
+    def _place_missing_levels(self, price):
+        """Rest every planned safety level that has no order on record. All of
+        them normally go in when the cycle opens; if a call failed part-way,
+        the rest go in on later polls. A level the price is already through is
+        left until price is back above it, so a repair never buys above plan."""
+        cid = self.cycle["id"]
+        have = {o["level_index"] for o in self.store.orders_for_cycle(cid, kinds=("level",))}
+        for lvl in self.plan.levels[1:]:
+            if lvl.index in have or lvl.index in self._refused_levels or price <= lvl.price:
+                continue
+            try:
+                o = self.api.submit_limit_order(self.symbol, lvl.qty, "buy", lvl.price)
+            except BrokerRefused as exc:
+                # Less exposure than planned, never more: run without it.
+                self._refused_levels.add(lvl.index)
+                log("warn", "Venue refused a safety level - the ladder runs without it",
+                    cycle_id=cid, level_index=lvl.index, error=str(exc))
+                continue
+            self.store.add_order({
+                "id": o["id"], "cycle_id": cid, "kind": "level", "level_index": lvl.index,
+                "side": "buy", "qty": lvl.qty, "limit_price": lvl.price, "status": "open",
+                "submitted_ts": self.now_ms(),
+            })
 
     # --- managing -----------------------------------------------------------
 
@@ -342,6 +475,8 @@ class MartingaleEngine:
             if expected > 0 and abs(pos_qty - expected) / expected > 0.05:
                 log("warn", "Position drift versus recorded fills", position_qty=pos_qty, expected_qty=expected)
 
+        self._place_missing_levels(price)
+
         target = tp_pct_for_age(age_h, self.plan.tp_pct, float(self.exit["breakeven_pct"]),
                                 float(self.exit["decay_start_hours"]), float(self.exit["max_hold_hours"]))
 
@@ -355,10 +490,12 @@ class MartingaleEngine:
 
         if (self.tp_order_id is None or self.tp_pct_current is None
                 or abs(target - self.tp_pct_current) >= float(self.exit["tp_replace_threshold_pct"])):
-            if self._cancel_tp():
+            outcome = self._cancel_tp()
+            if outcome == "filled":
                 self._finish_cycle("closed_tp", "take profit filled while being replaced")
                 return
-            self._place_tp(target)
+            if outcome == "clear":
+                self._place_tp(target)
 
     def _sync_orders(self):
         """Apply everything that changed at the broker since the last poll.
@@ -383,8 +520,8 @@ class MartingaleEngine:
             elif o["kind"] == "tp":
                 if status == "filled":
                     tp_filled = True
-                else:
-                    self.tp_order_id = None  # vanished - re-placed below
+                elif o["id"] == self.tp_order_id:
+                    self.tp_order_id = None  # gone - _manage places a fresh one
 
         for o, fq, fp in newly_filled:
             self.fills.append((fq, fp))
@@ -403,10 +540,15 @@ class MartingaleEngine:
             return True
 
         if newly_filled and self.tp_mode == "limit":
-            if self._cancel_tp():
+            outcome = self._cancel_tp()
+            if outcome == "filled":
                 self._finish_cycle("closed_tp", "take profit filled while being replaced")
                 return True
-            self._place_tp(self.tp_pct_current if self.tp_pct_current is not None else self.plan.tp_pct)
+            if outcome == "clear":
+                self._place_tp(self.tp_pct_current if self.tp_pct_current is not None else self.plan.tp_pct)
+            # "pending": the old TP is still live. Placing another would try to
+            # sell the same BTC twice; a later poll sees the cancel land and
+            # re-places it for the whole position.
         return False
 
     # --- take profit --------------------------------------------------------
@@ -418,7 +560,11 @@ class MartingaleEngine:
         sell while resting buys are open on the same symbol - fall back to a
         software take-profit for the rest of this cycle: the target is checked
         every poll and the position is sold at market when price reaches it.
-        A handled fallback, not an error."""
+        A handled fallback, not an error.
+
+        Only a definitive refusal switches modes. A timeout or outage just
+        propagates: the cycle keeps tp_order_id None and the next poll places
+        the take-profit again."""
         pos_qty, _ = self._position_qty()
         avg = average_entry(self.fills)
         if pos_qty <= 0 or not avg:
@@ -427,7 +573,7 @@ class MartingaleEngine:
         limit = round(avg * (1.0 + tp_pct), 2)
         try:
             o = self.api.submit_limit_order(self.symbol, pos_qty, "sell", limit)
-        except RuntimeError as exc:
+        except BrokerRefused as exc:
             self.tp_mode = "software"
             self.tp_order_id = None
             self.tp_pct_current = tp_pct
@@ -446,42 +592,49 @@ class MartingaleEngine:
             avg_entry=round(avg, 2), limit_price=limit, tp_pct=round(tp_pct, 5))
 
     def _cancel_tp(self):
-        """Cancel the resting take-profit. Returns True if it turns out to have
-        filled in the meantime, so the caller can close the cycle."""
+        """Cancel the resting take-profit and wait for the broker to confirm.
+
+        Returns "filled" if it filled first (the caller closes the cycle),
+        "clear" once nothing is resting, or "pending" if the broker has not
+        confirmed - then the caller must not place a replacement."""
         if not self.tp_order_id:
-            return False
+            return "clear"
         oid = self.tp_order_id
-        try:
-            self.api.cancel_order(oid)
-        except Exception as exc:
-            log("warn", "Cancel take-profit failed", order_id=oid, error=str(exc))
-        final = self.api.get_order(oid)
-        status = final.get("status", "canceled")
-        fq, fp = _f(final.get("filled_qty")), _f(final.get("filled_avg_price"))
-        self.store.update_order(oid, status if status in TERMINAL else "canceled",
-                                fq or None, fp or None, self.now_ms() if fq > 0 else None)
+        self._request_cancel(oid)
+        final = self._await_orders([oid])[oid]
+        if final.get("status") not in TERMINAL:
+            log("warn", "Take-profit cancel not confirmed yet - leaving it in place", order_id=oid,
+                status=final.get("status"))
+            return "pending"
+        self._record_final(oid, final)
         self.tp_order_id = None
-        return status == "filled"
+        return "filled" if final.get("status") == "filled" else "clear"
 
     # --- closing ------------------------------------------------------------
 
     def _cancel_remaining(self, cid):
-        """Cancel every order of this cycle still resting at the broker, and
-        record any partial fill that happened on the way out - it cost money."""
-        now = self.now_ms()
-        for o in self.store.orders_for_cycle(cid, statuses=("open",)):
-            try:
-                self.api.cancel_order(o["id"])
-            except Exception as exc:
-                log("warn", "Cancel failed", order_id=o["id"], error=str(exc))
-            final = self.api.get_order(o["id"])
-            st = final.get("status", "canceled")
-            fq, fp = _f(final.get("filled_qty")), _f(final.get("filled_avg_price"))
-            self.store.update_order(o["id"], st if st in TERMINAL else "canceled",
-                                    fq or None, fp or None, now if fq > 0 else None)
+        """Cancel every order of this cycle still resting at the broker, wait
+        for the cancels to be confirmed, and record any partial fill that
+        happened on the way out - it cost money. An order the broker has not
+        confirmed stays marked open; the flat check before the next cycle
+        deals with it."""
+        rows = self.store.orders_for_cycle(cid, statuses=("open",))
+        for o in rows:
+            self._request_cancel(o["id"])
+        finals = self._await_orders([o["id"] for o in rows])
+        unconfirmed = []
+        for o in rows:
+            final = finals[o["id"]]
+            if final.get("status") not in TERMINAL:
+                unconfirmed.append(o["id"])
+                continue
+            fq, fp = self._record_final(o["id"], final)
             if o["kind"] in ENTRY_KINDS and fq > 0 and (fq, fp) not in self.fills:
                 self.fills.append((fq, fp))
         self.tp_order_id = None
+        if unconfirmed:
+            log("warn", "Cancels not confirmed at close - checked again before the next cycle",
+                cycle_id=cid, order_ids=unconfirmed)
 
     def _finish_cycle(self, status, reason):
         """The one way a cycle ends: cancel what is still resting, sell what is
@@ -547,21 +700,25 @@ class MartingaleEngine:
             exit_qty=exit_qty, exit_price=round(exit_price, 2) if exit_price else None,
             pnl=pnl, held_hours=round(held_h, 2))
 
-        cooldown_min = {
-            "closed_stop": self.risk.get("cooldown_minutes_after_stop", 120),
-            "closed_timeout": self.risk.get("cooldown_minutes_after_timeout", 30),
-            "closed_tp": self.risk.get("cooldown_minutes_after_tp", 0),
-            "closed_reconcile": self.risk.get("cooldown_minutes_after_timeout", 30),
-        }.get(status, 0)
-        self.cooldown_until_ms = now + int(float(cooldown_min) * 60_000)
+        self.cooldown_until_ms = now + int(self._cooldown_minutes(status) * 60_000)
 
         self.cycle, self.plan, self.fills = None, None, []
         self.tp_order_id, self.tp_pct_current, self.tp_mode = None, None, "limit"
+        self._refused_levels = set()
 
     def _flatten_everything(self):
-        """Startup only: no cycle on record, but the broker has something."""
-        self.api.cancel_all_orders()
-        pos_qty, pos = self._position_qty()
+        """No cycle on record, but the broker has something for this symbol:
+        cancel its resting orders, wait for the cancels, sell what is held.
+        Only this symbol - never the whole account."""
+        orders = self._symbol_open_orders()
+        for o in orders:
+            self._request_cancel(o["id"])
+        for oid, final in self._await_orders([o["id"] for o in orders]).items():
+            if final.get("status") in TERMINAL:
+                self._record_final(oid, final)  # no-op for an order we never recorded
+            else:
+                log("warn", "Stray order cancel not confirmed - retried next poll", order_id=oid)
+        pos_qty, pos = self._held_qty()
         if pos_qty > 0 and pos is not None:
             order = self.api.close_position(pos["symbol"])
             order = await_terminal(self.api, order["id"], float(self.cfg["fill_timeout_seconds"]))
@@ -592,29 +749,32 @@ class MartingaleEngine:
     def status(self):
         with self._lock:
             counters = dict(self._counters)
+        # The API calls this from its own thread while the trading loop may be
+        # closing the cycle: read each attribute once and work on the copies.
+        row, plan, fills, tp_pct = self.cycle, self.plan, list(self.fills), self.tp_pct_current
         cycle = None
-        if self.cycle and self.plan:
-            avg = average_entry(self.fills)
-            age_h = (self.now_ms() - int(self.cycle["opened_ts"])) / 3_600_000
+        if row and plan:
+            avg = average_entry(fills)
+            age_h = (self.now_ms() - int(row["opened_ts"])) / 3_600_000
             cycle = {
-                "id": self.cycle["id"],
-                "opened_ts": self.cycle["opened_ts"],
+                "id": row["id"],
+                "opened_ts": row["opened_ts"],
                 "age_hours": round(age_h, 3),
-                "filled_levels": len(self.fills),
-                "safety_levels": len(self.plan.levels) - 1,
+                "filled_levels": len(fills),
+                "safety_levels": len(plan.levels) - 1,
                 "avg_entry": avg,
-                "position_qty_est": self._expected_position(),
+                "position_qty_est": sum(q for q, _ in fills) * (1.0 - self.fee),
                 "tp_mode": self.tp_mode,
-                "tp_pct_current": self.tp_pct_current,
-                "tp_price": self._tp_price(self.tp_pct_current),
-                "stop_price": self.plan.stop_price,
-                "reference_price": self.plan.reference_price,
-                "atr": self.plan.atr,
-                "atr_pct": self.plan.atr_pct,
-                "total_notional_planned": self.plan.total_notional,
-                "worst_case_loss": self.plan.worst_case_loss,
-                "binding": self.plan.binding,
-                "next_level_price": self.plan.levels[len(self.fills)].price if len(self.fills) < len(self.plan.levels) else None,
+                "tp_pct_current": tp_pct,
+                "tp_price": round(avg * (1.0 + tp_pct), 2) if avg and tp_pct is not None else None,
+                "stop_price": plan.stop_price,
+                "reference_price": plan.reference_price,
+                "atr": plan.atr,
+                "atr_pct": plan.atr_pct,
+                "total_notional_planned": plan.total_notional,
+                "worst_case_loss": plan.worst_case_loss,
+                "binding": plan.binding,
+                "next_level_price": plan.levels[len(fills)].price if len(fills) < len(plan.levels) else None,
             }
         return {
             "mode": "martingale-long",

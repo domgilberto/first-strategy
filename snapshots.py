@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from alpaca import CASH_FLOW_TYPES
 from runtime import log, running, sleep_interruptible
 
+LATE_FLOW_WINDOW_MS = 2 * 86_400_000
+
 
 def _num(v):
     try:
@@ -63,12 +65,20 @@ class Snapshotter:
 
     def ingest_cash_flows(self):
         """Page forward from the last known flow. The upsert is keyed on Alpaca's
-        activity id, so re-reading an overlap is harmless."""
+        activity id, so re-reading an overlap is harmless.
+
+        A flow dated inside an interval that has already been snapshotted -
+        Alpaca often gives a deposit only a date, which reads as midnight, and
+        an activity can appear after the fact - is applied to the next
+        snapshot instead. Otherwise it falls outside every (prev, now] window
+        and the equity jump it caused is booked as a return."""
         last_ts = self.store.last_flow_ts()
         after_iso = None
         if last_ts:
-            # Small overlap guards against same-timestamp rows split across pages.
-            after_iso = datetime.fromtimestamp((last_ts - 60_000) / 1000, tz=timezone.utc).isoformat()
+            # Re-read a generous overlap: date-only rows and late arrivals.
+            after_iso = datetime.fromtimestamp((last_ts - LATE_FLOW_WINDOW_MS) / 1000, tz=timezone.utc).isoformat()
+        prev = self.store.last_snapshot()
+        closed_until = prev["ts"] if prev else None
 
         inserted = 0
         page_token = None
@@ -78,12 +88,15 @@ class Snapshotter:
                 break
             parsed = []
             for r in rows:
-                ts = _parse_ts(r.get("date") or r.get("transaction_time") or r.get("activity_time"))
+                ts = _parse_ts(r.get("transaction_time") or r.get("activity_time")
+                               or r.get("created_at") or r.get("date"))
                 amount = _num(r.get("net_amount"))
                 if amount is None:
                     amount = _num(r.get("qty"))
                 if ts is None or amount is None or not r.get("id"):
                     continue
+                if closed_until is not None and closed_until - LATE_FLOW_WINDOW_MS < ts <= closed_until:
+                    ts = closed_until + 1
                 parsed.append({"id": r["id"], "ts": ts, "type": r.get("activity_type", ""), "amount": amount})
             inserted += self.store.upsert_cash_flows(parsed)
             if len(rows) < 100:

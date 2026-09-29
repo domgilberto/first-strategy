@@ -20,7 +20,7 @@ Required TradingHost strategy secrets (environment variables):
                          platform leaves TRADINGHOST_PORTS empty (see
                          resolve_api_port)
 
-Non-secret tunables live in config.json, seeded from config.example.json.
+Non-secret tunables live in the committed config.json.
 """
 
 import json

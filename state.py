@@ -132,6 +132,11 @@ MIGRATIONS = [
 CYCLE_UPDATABLE = {"filled_levels", "position_qty", "avg_entry", "status"}
 
 
+def markout_tolerance_ms(horizon_s):
+    """How late a markout may be taken and still carry its horizon's label."""
+    return max(120_000, int(horizon_s * 1000 * 0.25))
+
+
 def iso_utc(ms):
     """round_trips timestamps are ISO-8601 UTC strings; this produces the same
     shape so window bounds compare correctly as text."""
@@ -182,6 +187,13 @@ class Store:
     def get_open_cycle(self):
         row = self.db.execute(
             "SELECT * FROM cycles WHERE status = 'open' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+    def last_closed_cycle(self):
+        row = self.db.execute(
+            "SELECT * FROM cycles WHERE status != 'open' AND closed_ts IS NOT NULL "
+            "ORDER BY closed_ts DESC, id DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
 
@@ -246,20 +258,34 @@ class Store:
         sql += " ORDER BY submitted_ts ASC, level_index ASC"
         return [dict(r) for r in self.db.execute(sql, params).fetchall()]
 
+    def stale_open_orders(self):
+        """Order rows still marked open although their cycle has closed - a
+        cancel the broker had not confirmed by the time the cycle ended."""
+        rows = self.db.execute(
+            "SELECT o.* FROM cycle_orders o JOIN cycles c ON c.id = o.cycle_id "
+            "WHERE o.status = 'open' AND c.status != 'open'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- markouts -----------------------------------------------------------
 
     def pending_markouts(self, horizons, now_ms, limit=50):
         """Filled entry/exit orders whose horizon has elapsed and which have no
-        markout row yet for that horizon."""
+        markout row yet for that horizon.
+
+        Only while the horizon is recent: a "5-minute" markout taken two hours
+        late, after downtime, is a different number wearing the wrong label, so
+        it is skipped rather than recorded."""
         out = []
         for h in horizons:
+            due = int(h) * 1000
             rows = self.db.execute(
                 "SELECT o.id, o.side, o.filled_avg_price FROM cycle_orders o "
                 "WHERE o.status = 'filled' AND o.filled_ts IS NOT NULL AND o.filled_avg_price IS NOT NULL "
-                "AND o.filled_ts + ? <= ? "
+                "AND o.filled_ts + ? <= ? AND o.filled_ts + ? >= ? "
                 "AND NOT EXISTS (SELECT 1 FROM markouts m WHERE m.order_id = o.id AND m.horizon_s = ?) "
                 "LIMIT ?",
-                (int(h) * 1000, now_ms, int(h), limit),
+                (due, now_ms, due, now_ms - markout_tolerance_ms(h), int(h), limit),
             ).fetchall()
             out += [(r["id"], int(h), r["side"], float(r["filled_avg_price"])) for r in rows]
         return out
